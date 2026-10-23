@@ -2,7 +2,7 @@
 
 **A Rust EDA application, MCP-first, with one window and tabbed workspaces.**
 
-GPL-3.0-or-later. Inspired by KiCad workflows and the SolidCraft / Craft application
+GPL-3.0-or-later. Inspired by KiCad workflows and the SolidCore / Craft application
 architecture. Uses the pinned `craft-ui` library from `storytold/craft-libs`.
 
 **Status: first working foundation, not a KiCad replacement yet.** The current
