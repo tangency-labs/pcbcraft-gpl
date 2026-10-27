@@ -1,5 +1,7 @@
 use super::*;
-use pcbcraft_library::{FootprintDefinition, SymbolDefinition};
+use pcbcraft_library::{
+    FootprintDefinition, FootprintPad, Graphic, SymbolDefinition, SymbolPin, UnitGraphic,
+};
 
 pub(super) fn commands() -> Vec<CommandSpec> {
     [
@@ -8,8 +10,33 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         ("library.symbol.remove","Remove a project-library symbol; placed instances retain their embedded definition",schema(json!({"name":{"type":"string"}}),&["name"])),
         ("library.footprint.remove","Remove a project-library footprint; placed instances retain their embedded definition",schema(json!({"name":{"type":"string"}}),&["name"])),
         ("library.load","Load and validate a .pcbcraft-lib collection into the project as one undoable transaction",schema(json!({"path":{"type":"string"}}),&["path"])),
+        ("library.import_footprint_file","Read one footprint from a footprint library text file on disk and add or replace it in the project library as one undoable transaction",schema(json!({"path":{"type":"string","minLength":1,"maxLength":1024}}),&["path"])),
+        ("library.import_symbol_file","Read the symbols from a symbol library text file on disk and add or replace them in the project library as one undoable transaction",schema(json!({"path":{"type":"string","minLength":1,"maxLength":1024}}),&["path"])),
+        ("library.import_footprint_dir","Read every footprint library text file in a library folder on disk and add or replace them in the project library as one undoable transaction, so a whole vendor folder arrives in one step",schema(json!({"path":{"type":"string","minLength":1,"maxLength":1024}}),&["path"])),
         ("component.place_custom","Place a symbol from the editable project library",schema(json!({"name":{"type":"string"},"position":point_schema(),"reference":{"type":"string"},"value":{"type":"string"}}),&["name","position"])),
         ("footprint.assign_custom","Assign a project-library footprint whose pad numbers match the component pins",schema(json!({"id":id_schema(),"name":{"type":"string"}}),&["id","name"])),
+        ("library.footprint.set_model","Attach or replace a 3D model reference on a project-library footprint: a file path with an optional offset, scale and rotation in millimetres and degrees; placed instances keep their embedded copy",schema(json!({"name":{"type":"string"},"path":{"type":"string","maxLength":1024},"offset":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"scale":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"rotate":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3}}),&["name","path"])),
+        ("library.footprint.clear_model","Remove the 3D model reference from a project-library footprint",schema(json!({"name":{"type":"string"}}),&["name"])),
+        ("library.footprint.set_rules","Set design rule overrides on a project-library footprint: a local copper clearance and solder mask/paste margin shifts in millimetres; the clearance tightens clearance checks while the margins are recorded and exported",schema(json!({"name":{"type":"string"},"clearance":{"type":"number"},"mask_margin":{"type":"number"},"paste_margin":{"type":"number"}}),&["name"])),
+        ("library.footprint.clear_rules","Remove the design rule overrides from a project-library footprint",schema(json!({"name":{"type":"string"}}),&["name"])),
+        ("library.footprint.renumber_pads","Renumber pads on a project-library footprint with an ordered old-to-new map; embedded copies, their placed pads and matching component pins follow, and a target number already held by an untouched pad is refused",schema(json!({"name":{"type":"string"},"renames":{"type":"array","maxItems":512,"items":{"type":"object","properties":{"old":{"type":"string","maxLength":32},"new":{"type":"string","maxLength":32}},"required":["old","new"],"additionalProperties":false}}}),&["name","renames"])),
+        ("library.footprint.generate_courtyard","Generate a courtyard rectangle on a project-library footprint: the outline of its pads and artwork grown by a margin, replacing any courtyard the footprint already carries",schema(json!({"name":{"type":"string"},"margin":{"type":"number","minimum":0,"maximum":5,"description":"ring beyond the outermost copper and artwork, millimetres"}}),&["name","margin"])),
+        ("library.footprint.pad_set","Add or replace one pad on a project-library footprint by its number, so custom packages gain exposed pads, thermal vias or extra terminals without rewriting the whole definition; placed instances keep their embedded copy until footprint.refresh brings the change across",schema(json!({"name":{"type":"string"},"pad":{"type":"object","description":"a full pad: number, shape, size, position, layers and optional drill, as library readers emit them"}}),&["name","pad"])),
+        ("library.footprint.pad_remove","Remove one pad from a project-library footprint by its number; the footprint keeps at least one pad, and placed instances keep their embedded copy until footprint.refresh brings the change across",schema(json!({"name":{"type":"string"},"pad":{"type":"string","description":"pad number, exactly as stored"}}),&["name","pad"])),
+        ("library.footprint.duplicate","Copy a project-library footprint under a new name as one undoable step, the starting point for a custom variant of a vendor package; the original and every placed copy stay untouched",schema(json!({"name":{"type":"string"},"new_name":{"type":"string","description":"name for the copy, which must not exist yet"}}),&["name","new_name"])),
+        ("library.symbol.duplicate","Copy a project-library symbol under a new name as one undoable step, the starting point for a custom variant of a vendor symbol; the original and every placed copy stay untouched",schema(json!({"name":{"type":"string"},"new_name":{"type":"string","description":"name for the copy, which must not exist yet"}}),&["name","new_name"])),
+        ("library.symbol.pin_set","Add or replace one pin on a project-library symbol by its number, so custom symbols gain extra terminals, corrected pin names or repositioned leads without rewriting the whole definition; placed instances keep their embedded copy until symbol.refresh brings the change across",schema(json!({"name":{"type":"string"},"pin":{"type":"object","description":"a full pin: number, name, position, angle, length, electrical type, unit and body style, as library readers emit them"}}),&["name","pin"])),
+        ("library.symbol.pin_remove","Remove one pin from a project-library symbol by its number; the symbol keeps at least one pin, and placed instances keep their embedded copy until symbol.refresh brings the change across",schema(json!({"name":{"type":"string"},"pin":{"type":"string","description":"pin number, exactly as stored"}}),&["name","pin"])),
+        ("library.footprint.graphic_add","Draw one graphic (line, rectangle, circle, arc, polyline or text) onto a project-library footprint as one undoable step, the way a package gains its silk outline, courtyard art or documentation text; it travels with every embedded copy once the package is assigned or refreshed",schema(json!({"name":{"type":"string"},"graphic":{"type":"object","description":"a graphic primitive as library readers emit it: kind with its points, width, layer and optional fill"}}),&["name","graphic"])),
+        ("library.footprint.graphic_clear","Remove artwork from a project-library footprint in one undoable step: give a layer to clear just that layer's graphics, or omit it to clear every graphic, so stale silk and fab art can be wiped before redrawing",schema(json!({"name":{"type":"string"},"layer":{"type":"string","description":"layer to clear; omit to clear all graphics"}}),&["name"])),
+        ("library.symbol.graphic_add","Draw one graphic (line, rectangle, circle, arc, polyline or text) onto one unit of a project-library symbol as one undoable step, the way a symbol gains body art, pin decorations or documentation text; it travels with every embedded copy until symbol.refresh spreads it",schema(json!({"name":{"type":"string"},"unit":{"type":"integer","description":"symbol unit the graphic belongs to; defaults to 1"},"body_style":{"type":"integer","description":"body style the graphic belongs to; defaults to 1"},"graphic":{"type":"object","description":"a graphic primitive as library readers emit it: kind with its points, width, layer and optional fill"}}),&["name","graphic"])),
+        ("library.symbol.graphic_clear","Remove one unit's artwork from a project-library symbol in one undoable step, so stale symbol art can be wiped before redrawing; the unit keeps its pins",schema(json!({"name":{"type":"string"},"unit":{"type":"integer","description":"symbol unit whose graphics clear; defaults to 1"}}),&["name"])),
+        ("library.symbol.set_properties","Retype a project-library symbol's reference prefix, value, description, keywords or linked footprint one field at a time as one undoable step, so imported vendor symbols get cleaned up without rewriting the definition; placed instances keep their embedded copy until symbol.refresh brings the change across",schema(json!({"name":{"type":"string"},"reference":{"type":"string","description":"reference prefix pattern the symbol suggests, e.g. U*"},"value":{"type":"string"},"description":{"type":"string"},"keywords":{"type":"string","description":"space separated search words"},"footprint":{"type":"string","description":"default footprint name the symbol suggests"}}),&["name"])),
+        ("library.footprint.set_properties","Retype a project-library footprint's description or keywords one field at a time as one undoable step, so imported packages get cleaned up for search and documentation without rewriting the definition; placed instances keep their embedded copy until footprint.refresh brings the change across",schema(json!({"name":{"type":"string"},"description":{"type":"string"},"keywords":{"type":"string","description":"space separated search words"}}),&["name"])),
+        ("library.symbol.rename","Rename a project-library symbol in place as one undoable step, keeping every pin and graphic exactly as it was, so a typo at the source never needs a delete and re-upsert; placed instances keep the old embedded name",schema(json!({"name":{"type":"string"},"new_name":{"type":"string","minLength":1,"maxLength":128}}),&["name","new_name"])),
+        ("library.footprint.rename","Rename a project-library footprint in place as one undoable step, keeping every pad and graphic exactly as it was, so a typo at the source never needs a delete and re-upsert; placed instances keep the old embedded name",schema(json!({"name":{"type":"string"},"new_name":{"type":"string","minLength":1,"maxLength":128}}),&["name","new_name"])),
+        ("library.footprint.adopt","Copy a placed component's embedded footprint into the project library under a chosen name as one undoable step, so a package that arrived on a part becomes editable and reusable; adopting the same name again replaces that library entry",schema(json!({"id":id_schema(),"name":{"type":"string","description":"name to store the package under"}}),&["id","name"])),
+        ("library.symbol.adopt","Copy a placed component's embedded symbol into the project library under a chosen name as one undoable step, so a symbol that arrived on a part becomes editable and reusable; adopting the same name again replaces that library entry",schema(json!({"id":id_schema(),"name":{"type":"string","description":"name to store the symbol under"}}),&["id","name"])),
     ].into_iter().map(|(id,description,input_schema)|CommandSpec {id,description,input_schema}).collect()
 }
 #[derive(Deserialize)]
@@ -17,6 +44,24 @@ pub(super) fn commands() -> Vec<CommandSpec> {
 struct SymbolParams {
     definition: SymbolDefinition,
     notice: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PadRename {
+    old: String,
+    new: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenumberParams {
+    name: String,
+    renames: Vec<PadRename>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CourtyardParams {
+    name: String,
+    margin: f64,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +73,122 @@ struct FootprintParams {
 #[serde(deny_unknown_fields)]
 struct PathParams {
     path: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdoptParams {
+    id: Id,
+    name: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DuplicateParams {
+    name: String,
+    new_name: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PadSetParams {
+    name: String,
+    pad: FootprintPad,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameParams {
+    name: String,
+    new_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetPropertyParams {
+    name: String,
+    #[serde(default)]
+    reference: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    keywords: Option<String>,
+    #[serde(default)]
+    footprint: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphicAddParams {
+    name: String,
+    graphic: Graphic,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphicClearParams {
+    name: String,
+    #[serde(default)]
+    layer: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SymbolGraphicAddParams {
+    name: String,
+    #[serde(default)]
+    unit: Option<u32>,
+    #[serde(default)]
+    body_style: Option<u32>,
+    graphic: Graphic,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SymbolGraphicClearParams {
+    name: String,
+    #[serde(default)]
+    unit: Option<u32>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinSetParams {
+    name: String,
+    pin: SymbolPin,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinRemoveParams {
+    name: String,
+    pin: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PadRemoveParams {
+    name: String,
+    pad: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DirParams {
+    path: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelParams {
+    name: String,
+    path: String,
+    #[serde(default)]
+    offset: Option<[f64; 3]>,
+    #[serde(default)]
+    scale: Option<[f64; 3]>,
+    #[serde(default)]
+    rotate: Option<[f64; 3]>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RulesParams {
+    name: String,
+    #[serde(default)]
+    clearance: Option<f64>,
+    #[serde(default)]
+    mask_margin: Option<f64>,
+    #[serde(default)]
+    paste_margin: Option<f64>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -115,6 +276,338 @@ pub(super) fn run(
             }
             Ok(json!({"name":a.name}))
         }
+        "library.footprint.set_model" => {
+            let a: ModelParams = parse(params)?;
+            if a.path.is_empty() || a.path.len() > 1024 {
+                return Err(Error::Invalid("model path must be 1 to 1024 bytes".into()));
+            }
+            let sane = |v: &Option<[f64; 3]>, positive: bool| {
+                v.is_none_or(|t| {
+                    t.iter()
+                        .all(|x| x.is_finite() && x.abs() <= 100_000.0 && (!positive || *x > 0.0))
+                })
+            };
+            if !sane(&a.offset, false) || !sane(&a.rotate, false) || !sane(&a.scale, true) {
+                return Err(Error::Invalid(
+                    "model transforms must be finite, scales positive".into(),
+                ));
+            }
+            let def = p
+                .library
+                .footprints
+                .iter_mut()
+                .find(|s| s.name == a.name)
+                .ok_or_else(missing)?;
+            let offset = a.offset.unwrap_or([0.0; 3]);
+            let scale = a.scale.unwrap_or([1.0; 3]);
+            let rotate = a.rotate.unwrap_or([0.0; 3]);
+            let raw_source = format!(
+                "(model \"{}\" (offset (xyz {} {} {})) (scale (xyz {} {} {})) (rotate (xyz {} {} {})))",
+                a.path,
+                offset[0],
+                offset[1],
+                offset[2],
+                scale[0],
+                scale[1],
+                scale[2],
+                rotate[0],
+                rotate[1],
+                rotate[2]
+            );
+            def.model = Some(pcbcraft_library::Model3D {
+                path: a.path,
+                offset,
+                scale,
+                rotate,
+                raw_source,
+            });
+            def.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+            Ok(json!({"name": a.name, "path": def.model.as_ref().map(|m| m.path.clone())}))
+        }
+        "library.footprint.clear_model" => {
+            let a: Name = parse(params)?;
+            let def = p
+                .library
+                .footprints
+                .iter_mut()
+                .find(|s| s.name == a.name)
+                .ok_or_else(missing)?;
+            if def.model.is_none() {
+                return Err(missing());
+            }
+            def.model = None;
+            def.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+            Ok(json!({"name": a.name}))
+        }
+        "library.footprint.set_rules" => {
+            let a: RulesParams = parse(params)?;
+            if a.clearance.is_none() && a.mask_margin.is_none() && a.paste_margin.is_none() {
+                return Err(Error::Invalid("set at least one rule override".into()));
+            }
+            let bounded = |v: &Option<f64>| v.is_none_or(|x| x.is_finite() && x.abs() <= 100.0);
+            if !bounded(&a.clearance) || !bounded(&a.mask_margin) || !bounded(&a.paste_margin) {
+                return Err(Error::Invalid(
+                    "rule overrides must be finite and at most 100 mm".into(),
+                ));
+            }
+            let def = p
+                .library
+                .footprints
+                .iter_mut()
+                .find(|s| s.name == a.name)
+                .ok_or_else(missing)?;
+            def.rules = Some(pcbcraft_library::FootprintRules {
+                clearance: a.clearance,
+                mask_margin: a.mask_margin,
+                paste_margin: a.paste_margin,
+            });
+            def.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+            Ok(json!({"name": a.name, "rules": def.rules}))
+        }
+        "library.footprint.clear_rules" => {
+            let a: Name = parse(params)?;
+            let def = p
+                .library
+                .footprints
+                .iter_mut()
+                .find(|s| s.name == a.name)
+                .ok_or_else(missing)?;
+            if def.rules.is_none() {
+                return Err(missing());
+            }
+            def.rules = None;
+            def.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+            Ok(json!({"name": a.name}))
+        }
+        "library.footprint.generate_courtyard" => {
+            let a: CourtyardParams = parse(params)?;
+            if !a.margin.is_finite() || !(0.0..=5.0).contains(&a.margin) {
+                return Err(Error::Invalid(
+                    "the courtyard margin must be 0 to 5 millimetres".into(),
+                ));
+            }
+            let def = p
+                .library
+                .footprints
+                .iter_mut()
+                .find(|s| s.name == a.name)
+                .ok_or_else(missing)?;
+            let mut min = Point::new(f64::MAX, f64::MAX);
+            let mut max = Point::new(f64::MIN, f64::MIN);
+            let grow = |p: &mut Point, q: &mut Point, at: Point, radius: f64| {
+                if !at.valid() || !radius.is_finite() || radius < 0.0 {
+                    return;
+                }
+                p.x = p.x.min(at.x - radius);
+                p.y = p.y.min(at.y - radius);
+                q.x = q.x.max(at.x + radius);
+                q.y = q.y.max(at.y + radius);
+            };
+            for pad in &def.pads {
+                let half_x = pad.size.x / 2.0;
+                let half_y = pad.size.y / 2.0;
+                let (c, s) = (
+                    pad.rotation.to_radians().cos(),
+                    pad.rotation.to_radians().sin(),
+                );
+                let reach = (half_x * c).abs() + (half_y * s).abs();
+                let reach_y = (half_x * s).abs() + (half_y * c).abs();
+                grow(&mut min, &mut max, pad.position, reach.max(reach_y));
+            }
+            for graphic in &def.graphics {
+                if matches!(
+                    graphic,
+                    pcbcraft_library::Graphic::Rectangle { layer, .. }
+                        if layer == "pcbcraft.courtyard"
+                ) {
+                    continue;
+                }
+                let (points, radius): (Vec<Point>, f64) = match graphic {
+                    pcbcraft_library::Graphic::Line {
+                        start, end, width, ..
+                    } => (vec![*start, *end], *width / 2.0),
+                    pcbcraft_library::Graphic::Rectangle {
+                        start, end, width, ..
+                    } => (vec![*start, *end], *width / 2.0),
+                    pcbcraft_library::Graphic::Circle {
+                        center,
+                        radius,
+                        width,
+                        ..
+                    } => (vec![*center], *radius + width / 2.0),
+                    pcbcraft_library::Graphic::Arc {
+                        start,
+                        mid,
+                        end,
+                        width,
+                        ..
+                    } => (vec![*start, *mid, *end], *width / 2.0),
+                    pcbcraft_library::Graphic::Polyline { points, width, .. } => {
+                        (points.clone(), *width / 2.0)
+                    }
+                    _ => (vec![], 0.0),
+                };
+                for at in points {
+                    grow(&mut min, &mut max, at, radius);
+                }
+            }
+            if min.x > max.x || min.y > max.y {
+                return Err(Error::Invalid(
+                    "this footprint has no pads or artwork to surround".into(),
+                ));
+            }
+            let before = def.graphics.len();
+            def.graphics
+                .retain(|g| !matches!(g, pcbcraft_library::Graphic::Rectangle { layer, .. } if layer == "pcbcraft.courtyard"));
+            def.graphics.push(pcbcraft_library::Graphic::Rectangle {
+                start: Point::new(min.x - a.margin, min.y - a.margin),
+                end: Point::new(max.x + a.margin, max.y + a.margin),
+                width: 0.1,
+                fill: String::new(),
+                layer: "pcbcraft.courtyard".into(),
+            });
+            if let Err(e) = def.validate() {
+                def.graphics.truncate(before);
+                return Err(Error::Invalid(e.to_string()));
+            }
+            Ok(json!({
+                "name": a.name,
+                "courtyard": [
+                    min.x - a.margin,
+                    min.y - a.margin,
+                    max.x + a.margin,
+                    max.y + a.margin
+                ],
+                "margin": a.margin
+            }))
+        }
+        "library.footprint.renumber_pads" => {
+            let a: RenumberParams = parse(params)?;
+            if a.renames.is_empty() || a.renames.len() > 512 {
+                return Err(Error::Invalid(
+                    "pad renumbering needs 1 to 512 old-new pairs".into(),
+                ));
+            }
+            for r in &a.renames {
+                if r.old.is_empty() || r.new.is_empty() || r.old.len() > 32 || r.new.len() > 32 {
+                    return Err(Error::Invalid("pad numbers must be 1 to 32 bytes".into()));
+                }
+            }
+            let mut sources: Vec<&str> = a.renames.iter().map(|r| r.old.as_str()).collect();
+            sources.sort_unstable();
+            sources.dedup();
+            if sources.len() != a.renames.len() {
+                return Err(Error::Invalid(
+                    "each old pad number may appear once in the map".into(),
+                ));
+            }
+            let targets: Vec<&str> = a.renames.iter().map(|r| r.new.as_str()).collect();
+            let mut dedup: Vec<&str> = targets.clone();
+            dedup.sort_unstable();
+            dedup.dedup();
+            if dedup.len() != targets.len() {
+                return Err(Error::Invalid(
+                    "two pads cannot be renumbered to the same number".into(),
+                ));
+            }
+            let def = p
+                .library
+                .footprints
+                .iter_mut()
+                .find(|s| s.name == a.name)
+                .ok_or_else(missing)?;
+            for r in &a.renames {
+                if !def.pads.iter().any(|pad| pad.number == r.old) {
+                    return Err(Error::Invalid(format!(
+                        "this footprint has no pad {}",
+                        r.old
+                    )));
+                }
+            }
+            for target in &targets {
+                if !a.renames.iter().any(|r| r.old == **target)
+                    && def.pads.iter().any(|pad| pad.number == **target)
+                {
+                    return Err(Error::Invalid(format!(
+                        "pad number {target} is already used by a pad this map leaves alone"
+                    )));
+                }
+            }
+            let touched: Vec<(usize, String)> = def
+                .pads
+                .iter()
+                .enumerate()
+                .filter(|(_, pad)| a.renames.iter().any(|r| r.old == pad.number))
+                .map(|(i, pad)| (i, pad.number.clone()))
+                .collect();
+            for &(i, _) in &touched {
+                def.pads[i].number = String::new();
+            }
+            for (i, old) in &touched {
+                if let Some(r) = a.renames.iter().find(|r| r.old == *old) {
+                    def.pads[*i].number = r.new.clone();
+                }
+            }
+            if def.pads.iter().any(|pad| pad.number.is_empty()) {
+                return Err(Error::Invalid(
+                    "every renamed pad needs a new number".into(),
+                ));
+            }
+            def.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+            let affected: Vec<Id> = p
+                .components
+                .iter()
+                .filter(|c| {
+                    c.library_footprint
+                        .as_ref()
+                        .is_some_and(|f| f.definition.name == a.name)
+                })
+                .map(|c| c.id)
+                .collect();
+            for c in &mut p.components {
+                if !affected.contains(&c.id) {
+                    continue;
+                }
+                if let Some(embedded) = &mut c.library_footprint {
+                    for pad in &mut embedded.definition.pads {
+                        if let Some(r) = a.renames.iter().find(|r| r.old == pad.number) {
+                            pad.number = r.new.clone();
+                        }
+                    }
+                }
+                for pin in &mut c.pins {
+                    if let Some(r) = a.renames.iter().find(|r| r.old == pin.number) {
+                        pin.number = r.new.clone();
+                    }
+                }
+            }
+            for f in &mut p.board.footprints {
+                if !affected.contains(&f.component) {
+                    continue;
+                }
+                for pad in &mut f.pads {
+                    if let Some(r) = a.renames.iter().find(|r| r.old == pad.number) {
+                        pad.number = r.new.clone();
+                    }
+                    let geometry_new = pad.geometry.as_ref().and_then(|geometry| {
+                        a.renames
+                            .iter()
+                            .find(|r| r.old == geometry.number)
+                            .map(|r| r.new.clone())
+                    });
+                    if let (Some(geometry), Some(new)) =
+                        (pad.geometry.as_mut(), geometry_new.as_deref())
+                    {
+                        geometry.number = new.to_string();
+                    }
+                }
+            }
+            Ok(json!({
+                "name": a.name,
+                "renamed": touched.len(),
+                "components": affected.len()
+            }))
+        }
         "library.load" => {
             let a: PathParams = parse(params)?;
             let text = pcbcraft_io::read_text(std::path::Path::new(&a.path))?;
@@ -128,6 +621,568 @@ pub(super) fn run(
             file.library.validate()?;
             p.library = file.library;
             Ok(json!({"symbols":p.library.symbols.len(),"footprints":p.library.footprints.len()}))
+        }
+        "library.import_footprint_file" | "library.import_symbol_file" => {
+            let a: PathParams = parse(params)?;
+            let text =
+                pcbcraft_io::read_text(std::path::Path::new(&a.path)).map_err(Error::Invalid)?;
+            let mut imported: Vec<String> = Vec::new();
+            if command == "library.import_footprint_file" {
+                let def = pcbcraft_library::read_footprint(&text)
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                def.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+                imported.push(def.name.clone());
+                import_footprint(p, def);
+            } else {
+                let defs = pcbcraft_library::read_symbols(&text)
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                if defs.is_empty() {
+                    return Err(Error::Invalid("the library file defines no symbols".into()));
+                }
+                for def in defs {
+                    def.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+                    imported.push(def.name.clone());
+                    import_symbol(p, def);
+                }
+            }
+            p.library.validate()?;
+            Ok(json!({"names": imported}))
+        }
+        "library.import_footprint_dir" => {
+            let a: DirParams = parse(params)?;
+            let dir = std::path::Path::new(&a.path);
+            let entries = std::fs::read_dir(dir).map_err(|e| Error::Invalid(e.to_string()))?;
+            let mut files: Vec<std::path::PathBuf> = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|e| Error::Invalid(e.to_string()))?;
+                let path = entry.path();
+                if path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("kicad_mod"))
+                {
+                    files.push(path);
+                }
+            }
+            files.sort();
+            if files.is_empty() {
+                return Err(Error::Invalid(
+                    "the folder holds no footprint library text files".into(),
+                ));
+            }
+            if files.len() > 256 {
+                return Err(Error::Invalid(
+                    "a library folder may hold at most 256 footprint files".into(),
+                ));
+            }
+            let mut imported: Vec<String> = Vec::new();
+            for path in &files {
+                let text = pcbcraft_io::read_text(path).map_err(Error::Invalid)?;
+                let def = pcbcraft_library::read_footprint(&text)
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                def.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+                imported.push(def.name.clone());
+                import_footprint(p, def);
+            }
+            p.library.validate()?;
+            Ok(json!({"imported": imported.len(), "names": imported}))
+        }
+        "library.footprint.pad_set" => {
+            let a: PadSetParams = parse(params)?;
+            if a.name.is_empty() || a.name.len() > 128 {
+                return Err(Error::Invalid(
+                    "footprint name must be 1 to 128 bytes".into(),
+                ));
+            }
+            if a.pad.number.is_empty() || a.pad.number.len() > 32 {
+                return Err(Error::Invalid("pad number must be 1 to 32 bytes".into()));
+            }
+            let number = a.pad.number.clone();
+            let pads = {
+                let footprint = p
+                    .library
+                    .footprints
+                    .iter_mut()
+                    .find(|f| f.name == a.name)
+                    .ok_or_else(missing)?;
+                let replaced = footprint.pads.iter().any(|q| q.number == number);
+                if let Some(existing) = footprint.pads.iter_mut().find(|q| q.number == number) {
+                    *existing = a.pad;
+                } else {
+                    footprint.pads.push(a.pad);
+                }
+                footprint
+                    .validate()
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                (footprint.pads.len(), !replaced)
+            };
+            p.library.validate()?;
+            Ok(json!({"name": a.name, "pad": number, "added": pads.1, "pads": pads.0}))
+        }
+        "library.footprint.pad_remove" => {
+            let a: PadRemoveParams = parse(params)?;
+            if a.name.is_empty() || a.name.len() > 128 {
+                return Err(Error::Invalid(
+                    "footprint name must be 1 to 128 bytes".into(),
+                ));
+            }
+            if a.pad.is_empty() || a.pad.len() > 32 {
+                return Err(Error::Invalid("pad number must be 1 to 32 bytes".into()));
+            }
+            let name = a.name.clone();
+            let pads = {
+                let footprint = p
+                    .library
+                    .footprints
+                    .iter_mut()
+                    .find(|f| f.name == name)
+                    .ok_or_else(missing)?;
+                let before = footprint.pads.len();
+                footprint.pads.retain(|q| q.number != a.pad);
+                if footprint.pads.len() == before {
+                    return Err(Error::Invalid(format!(
+                        "footprint {name} has no pad {}",
+                        a.pad
+                    )));
+                }
+                if footprint.pads.is_empty() {
+                    return Err(Error::Invalid(
+                        "a footprint keeps at least one pad; remove the footprint itself instead"
+                            .into(),
+                    ));
+                }
+                footprint
+                    .validate()
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                footprint.pads.len()
+            };
+            p.library.validate()?;
+            Ok(json!({"name": name, "pad": a.pad, "pads": pads}))
+        }
+        "library.footprint.duplicate" | "library.symbol.duplicate" => {
+            let a: DuplicateParams = parse(params)?;
+            if a.name.is_empty()
+                || a.new_name.is_empty()
+                || a.name.len() > 128
+                || a.new_name.len() > 128
+            {
+                return Err(Error::Invalid(
+                    "library names must be 1 to 128 bytes".into(),
+                ));
+            }
+            if a.name == a.new_name {
+                return Err(Error::Invalid("the copy needs a name of its own".into()));
+            }
+            let foot = command == "library.footprint.duplicate";
+            if foot {
+                let source = p
+                    .library
+                    .footprints
+                    .iter()
+                    .find(|f| f.name == a.name)
+                    .ok_or_else(missing)?
+                    .clone();
+                if p.library.footprints.iter().any(|f| f.name == a.new_name) {
+                    return Err(Error::Invalid(format!(
+                        "a footprint named {} already exists",
+                        a.new_name
+                    )));
+                }
+                let mut copy = source;
+                copy.name = a.new_name.clone();
+                copy.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+                p.library.footprints.push(copy);
+                p.library.footprints.sort_by(|x, y| x.name.cmp(&y.name));
+            } else {
+                let source = p
+                    .library
+                    .symbols
+                    .iter()
+                    .find(|f| f.name == a.name)
+                    .ok_or_else(missing)?
+                    .clone();
+                if p.library.symbols.iter().any(|f| f.name == a.new_name) {
+                    return Err(Error::Invalid(format!(
+                        "a symbol named {} already exists",
+                        a.new_name
+                    )));
+                }
+                let mut copy = source;
+                copy.name = a.new_name.clone();
+                copy.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+                p.library.symbols.push(copy);
+                p.library.symbols.sort_by(|x, y| x.name.cmp(&y.name));
+            }
+            p.library.validate()?;
+            Ok(json!({"name": a.name, "new_name": a.new_name}))
+        }
+        "library.footprint.adopt" | "library.symbol.adopt" => {
+            let a: AdoptParams = parse(params)?;
+            if a.name.is_empty() || a.name.len() > 128 {
+                return Err(Error::Invalid(
+                    "library names must be 1 to 128 bytes".into(),
+                ));
+            }
+            let foot = command == "library.footprint.adopt";
+            let component = p
+                .components
+                .iter()
+                .find(|c| c.id == a.id)
+                .ok_or_else(missing)?;
+            if foot {
+                let source = component
+                    .library_footprint
+                    .as_ref()
+                    .map(|f| f.definition.clone())
+                    .ok_or_else(|| {
+                        Error::Invalid("that component carries no embedded footprint".into())
+                    })?;
+                let mut def = source;
+                def.name = a.name.clone();
+                def.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+                import_footprint(p, def);
+            } else {
+                let source = component
+                    .library_symbol
+                    .as_ref()
+                    .map(|f| f.definition.clone())
+                    .ok_or_else(|| {
+                        Error::Invalid("that component carries no embedded symbol".into())
+                    })?;
+                let mut def = source;
+                def.name = a.name.clone();
+                def.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+                import_symbol(p, def);
+            }
+            p.library.validate()?;
+            Ok(json!({"id": a.id, "name": a.name}))
+        }
+        "library.symbol.pin_set" => {
+            let a: PinSetParams = parse(params)?;
+            if a.name.is_empty() || a.name.len() > 128 {
+                return Err(Error::Invalid("symbol name must be 1 to 128 bytes".into()));
+            }
+            if a.pin.number.is_empty() || a.pin.number.len() > 32 {
+                return Err(Error::Invalid("pin number must be 1 to 32 bytes".into()));
+            }
+            let number = a.pin.number.clone();
+            let pins = {
+                let symbol = p
+                    .library
+                    .symbols
+                    .iter_mut()
+                    .find(|f| f.name == a.name)
+                    .ok_or_else(missing)?;
+                let replaced = symbol.pins.iter().any(|q| q.number == number);
+                if let Some(existing) = symbol.pins.iter_mut().find(|q| q.number == number) {
+                    *existing = a.pin;
+                } else {
+                    symbol.pins.push(a.pin);
+                }
+                symbol
+                    .validate()
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                (symbol.pins.len(), !replaced)
+            };
+            p.library.validate()?;
+            Ok(json!({"name": a.name, "pin": number, "added": pins.1, "pins": pins.0}))
+        }
+        "library.symbol.pin_remove" => {
+            let a: PinRemoveParams = parse(params)?;
+            if a.name.is_empty() || a.name.len() > 128 {
+                return Err(Error::Invalid("symbol name must be 1 to 128 bytes".into()));
+            }
+            if a.pin.is_empty() || a.pin.len() > 32 {
+                return Err(Error::Invalid("pin number must be 1 to 32 bytes".into()));
+            }
+            let name = a.name.clone();
+            let pins = {
+                let symbol = p
+                    .library
+                    .symbols
+                    .iter_mut()
+                    .find(|f| f.name == name)
+                    .ok_or_else(missing)?;
+                let before = symbol.pins.len();
+                symbol.pins.retain(|q| q.number != a.pin);
+                if symbol.pins.len() == before {
+                    return Err(Error::Invalid(format!(
+                        "symbol {name} has no pin {}",
+                        a.pin
+                    )));
+                }
+                if symbol.pins.is_empty() {
+                    return Err(Error::Invalid(format!(
+                        "symbol {name} would lose its last pin"
+                    )));
+                }
+                symbol
+                    .validate()
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                symbol.pins.len()
+            };
+            p.library.validate()?;
+            Ok(json!({"name": name, "pin": a.pin, "pins": pins}))
+        }
+        "library.footprint.graphic_add" => {
+            let a: GraphicAddParams = parse(params)?;
+            if a.name.is_empty() || a.name.len() > 128 {
+                return Err(Error::Invalid(
+                    "footprint name must be 1 to 128 bytes".into(),
+                ));
+            }
+            let layer = graphic_layer(&a.graphic)?;
+            let graphics = {
+                let footprint = p
+                    .library
+                    .footprints
+                    .iter_mut()
+                    .find(|f| f.name == a.name)
+                    .ok_or_else(missing)?;
+                footprint.graphics.push(a.graphic);
+                footprint
+                    .validate()
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                footprint.graphics.len()
+            };
+            p.library.validate()?;
+            Ok(json!({"name": a.name, "layer": layer, "graphics": graphics}))
+        }
+        "library.footprint.graphic_clear" => {
+            let a: GraphicClearParams = parse(params)?;
+            if a.name.is_empty() || a.name.len() > 128 {
+                return Err(Error::Invalid(
+                    "footprint name must be 1 to 128 bytes".into(),
+                ));
+            }
+            if a.layer.as_deref().is_some_and(str::is_empty) {
+                return Err(Error::Invalid("layer must not be empty".into()));
+            }
+            let name = a.name.clone();
+            let graphics = {
+                let footprint = p
+                    .library
+                    .footprints
+                    .iter_mut()
+                    .find(|f| f.name == name)
+                    .ok_or_else(missing)?;
+                let before = footprint.graphics.len();
+                for graphic in &footprint.graphics {
+                    graphic_layer(graphic)?;
+                }
+                let kept: Vec<Graphic> = match &a.layer {
+                    Some(layer) => footprint
+                        .graphics
+                        .iter()
+                        .filter(|g| graphic_layer(g).is_ok_and(|l| l != *layer))
+                        .cloned()
+                        .collect(),
+                    None => Vec::new(),
+                };
+                footprint.graphics = kept;
+                if footprint.graphics.len() == before {
+                    return Err(Error::Invalid(format!(
+                        "footprint {name} has no graphics to remove"
+                    )));
+                }
+                footprint
+                    .validate()
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                (before, footprint.graphics.len())
+            };
+            p.library.validate()?;
+            Ok(json!({
+                "name": name,
+                "removed": graphics.0 - graphics.1,
+                "graphics": graphics.1
+            }))
+        }
+        "library.symbol.graphic_add" => {
+            let a: SymbolGraphicAddParams = parse(params)?;
+            if a.name.is_empty() || a.name.len() > 128 {
+                return Err(Error::Invalid("symbol name must be 1 to 128 bytes".into()));
+            }
+            let unit = a.unit.unwrap_or(1);
+            let body_style = a.body_style.unwrap_or(1);
+            let layer = graphic_layer(&a.graphic)?;
+            let graphics = {
+                let symbol = p
+                    .library
+                    .symbols
+                    .iter_mut()
+                    .find(|f| f.name == a.name)
+                    .ok_or_else(missing)?;
+                symbol.graphics.push(UnitGraphic {
+                    unit,
+                    body_style,
+                    primitive: a.graphic,
+                });
+                symbol
+                    .validate()
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                symbol.graphics.len()
+            };
+            p.library.validate()?;
+            Ok(json!({"name": a.name, "unit": unit, "layer": layer, "graphics": graphics}))
+        }
+        "library.symbol.graphic_clear" => {
+            let a: SymbolGraphicClearParams = parse(params)?;
+            if a.name.is_empty() || a.name.len() > 128 {
+                return Err(Error::Invalid("symbol name must be 1 to 128 bytes".into()));
+            }
+            let unit = a.unit.unwrap_or(1);
+            let name = a.name.clone();
+            let graphics = {
+                let symbol = p
+                    .library
+                    .symbols
+                    .iter_mut()
+                    .find(|f| f.name == name)
+                    .ok_or_else(missing)?;
+                let before = symbol.graphics.len();
+                symbol.graphics.retain(|g| g.unit != unit);
+                if symbol.graphics.len() == before {
+                    return Err(Error::Invalid(format!(
+                        "symbol {name} has no graphics on unit {unit}"
+                    )));
+                }
+                symbol
+                    .validate()
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                (before, symbol.graphics.len())
+            };
+            p.library.validate()?;
+            Ok(json!({
+                "name": name,
+                "unit": unit,
+                "removed": graphics.0 - graphics.1,
+                "graphics": graphics.1
+            }))
+        }
+        "library.symbol.set_properties" | "library.footprint.set_properties" => {
+            let a: SetPropertyParams = parse(params)?;
+            if a.name.is_empty() || a.name.len() > 128 {
+                return Err(Error::Invalid(
+                    "library names must be 1 to 128 bytes".into(),
+                ));
+            }
+            let symbol = command == "library.symbol.set_properties";
+            let touched = a.reference.is_some()
+                || a.value.is_some()
+                || a.description.is_some()
+                || a.keywords.is_some()
+                || a.footprint.is_some();
+            if !touched {
+                return Err(Error::Invalid(
+                    "give at least one property to change".into(),
+                ));
+            }
+            for text in [
+                a.reference.as_deref(),
+                a.value.as_deref(),
+                a.description.as_deref(),
+                a.keywords.as_deref(),
+                a.footprint.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if text.len() > 128 * 1024 {
+                    return Err(Error::Invalid(
+                        "library text fields are capped at 128 KiB".into(),
+                    ));
+                }
+            }
+            let name = a.name.clone();
+            let item = if symbol {
+                let symbol = p
+                    .library
+                    .symbols
+                    .iter_mut()
+                    .find(|f| f.name == name)
+                    .ok_or_else(missing)?;
+                if let Some(v) = a.reference {
+                    symbol.reference = v;
+                }
+                if let Some(v) = a.value {
+                    symbol.value = v;
+                }
+                if let Some(v) = a.description {
+                    symbol.description = v;
+                }
+                if let Some(v) = a.keywords {
+                    symbol.keywords = v;
+                }
+                if let Some(v) = a.footprint {
+                    symbol.footprint = v;
+                }
+                symbol
+                    .validate()
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                symbol.name.clone()
+            } else {
+                let footprint = p
+                    .library
+                    .footprints
+                    .iter_mut()
+                    .find(|f| f.name == name)
+                    .ok_or_else(missing)?;
+                if a.reference.is_some() || a.value.is_some() || a.footprint.is_some() {
+                    return Err(Error::Invalid(
+                        "footprints carry description and keywords only".into(),
+                    ));
+                }
+                if let Some(v) = a.description {
+                    footprint.description = v;
+                }
+                if let Some(v) = a.keywords {
+                    footprint.keywords = v;
+                }
+                footprint
+                    .validate()
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                footprint.name.clone()
+            };
+            p.library.validate()?;
+            Ok(json!({"name": item}))
+        }
+        "library.symbol.rename" | "library.footprint.rename" => {
+            let a: RenameParams = parse(params)?;
+            if a.name.is_empty() || a.name.len() > 128 {
+                return Err(Error::Invalid(
+                    "library names must be 1 to 128 bytes".into(),
+                ));
+            }
+            if a.new_name.is_empty() || a.new_name.len() > 128 {
+                return Err(Error::Invalid("new name must be 1 to 128 bytes".into()));
+            }
+            if command == "library.symbol.rename" {
+                let Some(found) = p.library.symbols.iter().position(|i| i.name == a.name) else {
+                    return Err(missing());
+                };
+                if p.library.symbols.iter().any(|i| i.name == a.new_name) {
+                    return Err(Error::Invalid(format!(
+                        "a library item is already named {}",
+                        a.new_name
+                    )));
+                }
+                p.library.symbols[found].name = a.new_name.clone();
+            } else {
+                let Some(found) = p.library.footprints.iter().position(|i| i.name == a.name) else {
+                    return Err(missing());
+                };
+                if p.library.footprints.iter().any(|i| i.name == a.new_name) {
+                    return Err(Error::Invalid(format!(
+                        "a library item is already named {}",
+                        a.new_name
+                    )));
+                }
+                p.library.footprints[found].name = a.new_name.clone();
+            }
+            p.library.validate()?;
+            p.validate()?;
+            Ok(json!({"name": a.new_name}))
         }
         "component.place_custom" => {
             let a: Place = parse(params)?;
@@ -161,4 +1216,37 @@ pub(super) fn run(
         }
         _ => Err(Error::Invalid("unknown library authoring command".into())),
     })())
+}
+
+fn import_footprint(p: &mut Project, def: pcbcraft_library::FootprintDefinition) {
+    if let Some(existing) = p.library.footprints.iter_mut().find(|f| f.name == def.name) {
+        *existing = def;
+    } else {
+        p.library.footprints.push(def);
+    }
+    p.library.footprints.sort_by(|a, b| a.name.cmp(&b.name));
+}
+
+fn import_symbol(p: &mut Project, def: pcbcraft_library::SymbolDefinition) {
+    if let Some(existing) = p.library.symbols.iter_mut().find(|s| s.name == def.name) {
+        *existing = def;
+    } else {
+        p.library.symbols.push(def);
+    }
+    p.library.symbols.sort_by(|a, b| a.name.cmp(&b.name));
+}
+
+fn graphic_layer(graphic: &Graphic) -> Result<String, Error> {
+    let layer = match graphic {
+        Graphic::Line { layer, .. }
+        | Graphic::Rectangle { layer, .. }
+        | Graphic::Circle { layer, .. }
+        | Graphic::Arc { layer, .. }
+        | Graphic::Polyline { layer, .. }
+        | Graphic::Text { layer, .. } => layer,
+    };
+    if layer.is_empty() || layer.len() > 64 {
+        return Err(Error::Invalid("layer must be 1 to 64 bytes".into()));
+    }
+    Ok(layer.clone())
 }
