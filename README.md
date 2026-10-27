@@ -16,8 +16,41 @@ board export. The complete EDA roadmap is in [ROADMAP.md](ROADMAP.md).
 - Dark default, light theme, persistent accent and grid preferences, zoom around
   the cursor, middle-button pan, symbol previews and drag-to-move.
 - Periodic project recovery and recovery on normal close, using application storage.
+- One-command alignment and distribution for groups of schematic symbols or
+  board footprints: flush left/right/top/bottom, shared horizontal or vertical
+  centre, even spacing along an axis, or snapping placements to the nearest
+  multiple of a grid. Mirror a placed symbol or footprint left-to-right or
+  top-to-bottom about its own origin; pins, pads, embedded library graphics
+  and per-unit placements all flip together and two mirrors cancel exactly.
+- Split an existing copper segment or drawn wire at any point on it; both
+  halves keep the net, width and layer of the original. Cut the corner
+  between two joined same-net track segments with a diagonal chamfer.
+  Duplicate components
+  at an offset with fresh ids and automatically unique reference labels,
+  bringing the physical footprint when one is assigned. Placed copper
+  segments and vias move after the fact, and the clearance findings follow
+  the move. Reference designators and net names can be renamed at any time,
+  validated unique against the rest of the design, and a netlist table can be
+  imported in one step to assign pins to named nets by reference, or read back
+  as a net-by-net pin table that also lists every unconnected pin. Components
+  carry named properties (datasheet, manufacturer, custom notes) that are set,
+  replaced or cleared one at a time and travel with a duplicate, and a bill of
+  materials groups the design by value, kind and footprint with any requested
+  properties as extra grouping columns.
 - Original resistor, capacitor, LED and two-pin connector symbols; explicit
-  logical nets and pin-to-pin orthogonal wire presentations.
+  logical nets, pin-to-pin orthogonal wire presentations and free-form drawn
+  wires with explicit vertices that may be bound to a net and edited after
+  the fact (insert or remove any vertex), and free-standing
+  schematic/board graphics (lines, rectangles, circles, arcs, polygons and text);
+  local/global/hierarchical/power labels, junctions and no-connect flags that
+  suppress the matching ERC warning, all movable after placement (graphics by
+  delta, labels to an absolute position, junctions only onto a vertex of
+  their net) and rotatable (graphics in 90-degree steps about their centre or
+  a chosen pivot, labels by any angle); plated through-hole vias that join front
+  and back copper, including stitch grids that fill a rectangular area with a
+  via lattice; poured copper zones as closed polygons on either layer, with
+  cutouts that remove copper from a zone; a moved zone shifts its outline and
+  every cutout together.
 - Background search and geometry previews of installed KiCad symbol/footprint
   libraries, including inherited definitions. Place supported symbols with
   independently movable schematic units within one physical package, assign
@@ -26,6 +59,8 @@ board export. The complete EDA roadmap is in [ROADMAP.md](ROADMAP.md).
   pad/drill dimensions, and line/rectangle/circle/arc/polyline/text graphics. Save
   undoable project-library definitions and reusable `.pcbcraft-lib` collections.
 - Schematic-to-PCB sync retains existing placements and reconciles pad nets.
+  A pad table report lists every board pad by component reference with its net,
+  position, shape, size and drill, for the whole board or one component.
 - Real circle/rectangle/roundrect/oval front SMD and plated through-hole pads,
   circular/oval offset drills, plus generic starter pads;
   straight or two-segment orthogonal tracks;
@@ -34,9 +69,12 @@ board export. The complete EDA roadmap is in [ROADMAP.md](ROADMAP.md).
   exported as Edge.Cuts. Constrained/parametric outline sketches are planned.
 - Initial pin assignment/net-population checks and copper short, clearance,
   board-edge, cutout and unrouted checks with affected object IDs.
-- 26 engine commands, discoverable schemas, atomic batches, stable IDs,
+- Named net classes: group nets once and every clearance check between their
+  copper uses the strictest requirement involved, while new tracks and routes
+  on a classified net start at that class's width unless a width is given.
+- 60 engine commands, discoverable schemas, atomic batches, stable IDs,
   revision guards, 32-step undo/redo and validated atomic project saves.
-- 44 MCP tools: every engine command plus library discovery/search/inspection,
+- 78 MCP tools: every engine command plus library discovery/search/inspection,
   design inspection, checks, persistence,
   export and PNG previews. Headless or bridged into the actual running desktop.
 - Rust browser entry point; the shared UI and engine compile to WebAssembly.
