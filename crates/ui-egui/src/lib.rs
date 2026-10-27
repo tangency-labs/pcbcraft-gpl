@@ -6,6 +6,183 @@ use egui::{Align2, Color32, FontId, Rect, Stroke, Vec2};
 use pcbcraft_doc::{Id, PinRef, Project, TEMPLATES};
 use pcbcraft_geom::Point;
 use pcbcraft_mcp::SharedSession;
+
+/// Help copy shown under the inspector's editable fields. Each line names
+/// what the field is for and the limit the engine will enforce, so the
+/// requirement is visible before the first rejected edit.
+const FIELD_HELP_VALUE: &str = "Free text: a name or value, like R1 or 10k. It updates the symbol or package immediately when Apply is pressed.";
+const FIELD_HELP_POSITION: &str =
+    "Absolute millimetres from the design origin; Apply moves just this symbol or package.";
+const FIELD_HELP_BOARD: &str =
+    "Board outline size in millimetres; both values must be larger than zero.";
+const FIELD_HELP_CUTOUT: &str =
+    "Radius of the circle the cutout tool places; the whole circle must stay inside the board.";
+
+fn field_help(ui: &mut egui::Ui, text: &str, muted: egui::Color32) {
+    ui.label(egui::RichText::new(text).small().color(muted).weak());
+}
+
+/// The complete input reference: every key binding the app installs, plus
+/// the canvas mouse gestures, with where each one applies. The overlay and
+/// the tests read this one table, so the list can never claim a key the
+/// handler does not install.
+fn shortcut_rows() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        ("Ctrl+Z", "Undo the last action", "anywhere"),
+        ("Ctrl+Shift+Z", "Redo an undone action", "anywhere"),
+        ("Ctrl+Y", "Redo an undone action", "anywhere"),
+        ("Ctrl+S", "Save the design to its file", "anywhere"),
+        ("Ctrl+K", "Open the command palette", "anywhere"),
+        ("?", "Show or hide this shortcut list", "anywhere"),
+        ("A", "Open the symbol palette", "schematic tab"),
+        (
+            "W",
+            "Wire tool: click two pins to connect them",
+            "schematic tab",
+        ),
+        (
+            "X",
+            "Route tool: click two pads to start a track",
+            "pcb tab",
+        ),
+        (
+            "M",
+            "Move tool: drop the selection at the cursor",
+            "anywhere",
+        ),
+        (
+            "R",
+            "Rotate the hovered or selected object by 90 degrees",
+            "anywhere",
+        ),
+        (
+            "E",
+            "Load the hovered or selected object into the inspector",
+            "anywhere",
+        ),
+        ("Home", "Zoom the view so the whole design fits", "anywhere"),
+        ("Delete", "Delete the selected object", "anywhere"),
+        (
+            "Esc",
+            "Return to the select tool and close open palettes",
+            "anywhere",
+        ),
+        ("Middle-drag", "Pan the view", "canvas"),
+        ("Scroll", "Zoom the view", "canvas"),
+    ]
+}
+
+/// What the mouse and keys will do next for the active tool. The strip is
+/// rendered under the toolbar so the next action is always visible instead
+/// of being something the user has to remember.
+fn tool_hint(tool: &Tool) -> String {
+    let common = " · middle-drag: pan · scroll: zoom · Esc: back to select";
+    match tool {
+        Tool::Select => format!("LMB: select an object · drag: move the selected object{common}"),
+        Tool::Place(_) => format!("LMB: place the symbol at the cursor{common}"),
+        Tool::LibraryPlace(..) | Tool::CustomPlace(..) => {
+            format!("LMB: place the symbol package at the cursor{common}")
+        }
+        Tool::Wire(None) => format!("LMB: pick the first pin of the new wire{common}"),
+        Tool::Wire(Some(_)) => {
+            format!("LMB: pick the second pin to complete the wire{common}")
+        }
+        Tool::Route(None) => format!("LMB: pick the first pad to start the track{common}"),
+        Tool::Route(Some(_)) => {
+            format!("LMB: pick the second pad to complete the track{common}")
+        }
+        Tool::Move => format!("LMB: drop the selected object at the cursor{common}"),
+        Tool::Cutout => format!("LMB: place a circular cutout at the cursor{common}"),
+    }
+}
+
+/// Case-insensitive subsequence match: every character of the query must
+/// appear, in order, somewhere in the text.
+fn fuzzy_match(query: &str, text: &str) -> bool {
+    let mut text = text.chars();
+    query
+        .chars()
+        .all(|q| text.any(|t| t.eq_ignore_ascii_case(&q)))
+}
+
+/// A starter parameters object for a command: every required parameter gets
+/// a plausible sample value taken from its own schema (the schema default,
+/// the first listed option, the schema minimum, or a neutral stand-in), so
+/// picking a command in the palette immediately shows the shape its
+/// parameters must have; optional parameters are left out to be added.
+fn params_template(spec: &pcbcraft_engine::CommandSpec) -> String {
+    template_object(&spec.input_schema).to_string()
+}
+
+fn template_object(schema: &Value) -> Value {
+    let properties = schema.get("properties").cloned().unwrap_or(Value::Null);
+    let keys: Vec<String> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut object = serde_json::Map::new();
+    for key in keys {
+        if let Some(field) = properties.get(&key) {
+            object.insert(key, sample_value(field));
+        }
+    }
+    Value::Object(object)
+}
+
+fn sample_value(schema: &Value) -> Value {
+    if let Some(default) = schema.get("default") {
+        return default.clone();
+    }
+    if let Some(options) = schema.get("enum").and_then(Value::as_array)
+        && let Some(first) = options.first()
+    {
+        return first.clone();
+    }
+    match schema.get("type").and_then(Value::as_str) {
+        Some("integer") => schema.get("minimum").cloned().unwrap_or(json!(1)),
+        Some("number") => schema.get("minimum").cloned().unwrap_or(json!(0.0)),
+        Some("boolean") => json!(false),
+        Some("string") => json!(""),
+        Some("array") => {
+            let count = schema
+                .get("minItems")
+                .and_then(Value::as_u64)
+                .unwrap_or(2)
+                .clamp(2, 8);
+            let item = schema
+                .get("items")
+                .map(sample_value)
+                .unwrap_or(json!([0.0, 0.0]));
+            Value::Array(vec![item; count as usize])
+        }
+        _ => {
+            if schema.get("properties").is_some() {
+                template_object(schema)
+            } else {
+                json!("")
+            }
+        }
+    }
+}
+
+/// Hover text for a control that runs an engine command: the command
+/// registry description is the single source of truth for what the control
+/// does, so the UI explanation and the command documentation never drift.
+fn command_tip(id: &str) -> String {
+    pcbcraft_engine::commands()
+        .into_iter()
+        .find(|spec| spec.id == id)
+        .map_or_else(
+            || "This control runs an engine command.".into(),
+            |spec| spec.description.to_string(),
+        )
+}
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -92,6 +269,9 @@ pub struct App {
     command: String,
     params: String,
     command_open: bool,
+    command_query: String,
+    shortcuts_open: bool,
+    command_focus: bool,
     capture: Option<String>,
     frames: u32,
     library: library::Browser,
@@ -200,6 +380,9 @@ impl App {
             command: "component.add".into(),
             params: "{\"kind\":\"resistor\",\"position\":{\"x\":30,\"y\":20}}".into(),
             command_open: false,
+            command_query: String::new(),
+            shortcuts_open: false,
+            command_focus: false,
             capture,
             frames: 0,
             library,
@@ -228,6 +411,16 @@ impl App {
             self.load_properties();
         }
     }
+    fn execute_palette_params(&mut self) {
+        match serde_json::from_str(&self.params.clone()) {
+            Ok(v) => {
+                let command = self.command.clone();
+                self.run(&command, v);
+            }
+            Err(e) => self.message = e.to_string(),
+        }
+    }
+
     fn run(&mut self, command: &str, params: Value) {
         let result = self
             .session
@@ -391,6 +584,7 @@ impl App {
                 }
                 if i.key_pressed(egui::Key::K) {
                     self.command_open = !self.command_open;
+                    self.command_focus = self.command_open;
                 }
                 return;
             }
@@ -423,6 +617,10 @@ impl App {
                 self.tool = Tool::Select;
                 self.drag = None;
                 self.palette = false;
+                self.shortcuts_open = false;
+            }
+            if i.key_pressed(egui::Key::Slash) {
+                self.shortcuts_open = !self.shortcuts_open;
             }
             if i.key_pressed(egui::Key::Delete)
                 && let Some(id) = self.selected
@@ -469,7 +667,7 @@ impl App {
         });
     }
     fn header(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("header").exact_size(118.0).show(ui, |ui| {
+        egui::Panel::top("header").exact_size(140.0).show(ui, |ui| {
             ui.add_space(7.0);
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
@@ -488,13 +686,13 @@ impl App {
                     if ui.button("Appearance").clicked() {
                         self.appearance = !self.appearance;
                     }
-                    if ui.button("Save  Ctrl+S").clicked() {
+                    if ui.button("Save  Ctrl+S").on_hover_text("Write the design to its file on disk.").clicked() {
                         self.tool_call("save", json!({"path":self.path}));
                     }
-                    if ui.button("Redo").clicked() {
+                    if ui.button("Redo").on_hover_text("Step forward to the action you undid.").clicked() {
                         self.tool_call("redo", json!({}));
                     }
-                    if ui.button("Undo").clicked() {
+                    if ui.button("Undo").on_hover_text("Step back one action; every edit here is one undoable step.").clicked() {
                         self.tool_call("undo", json!({}));
                     }
                     ui.label(
@@ -558,16 +756,17 @@ impl App {
                 }
                 match self.tab {
                     Tab::Schematic => {
-                        if ui.button("Add symbol  A").clicked() {
+                        if ui.button("Add symbol  A").on_hover_text(command_tip("component.add")).clicked() {
                             self.palette = !self.palette;
                         }
                         if ui
                             .selectable_label(matches!(self.tool, Tool::Wire(_)), "Wire  W")
+                            .on_hover_text(command_tip("wire.draw"))
                             .clicked()
                         {
                             self.tool = Tool::Wire(None);
                         }
-                        if ui.button("Sync to PCB >").clicked() {
+                        if ui.button("Sync to PCB >").on_hover_text(command_tip("board.sync")).clicked() {
                             self.run("board.sync", json!({}));
                             self.change_tab(Tab::Pcb);
                         }
@@ -590,15 +789,17 @@ impl App {
                             });
                         if ui
                             .selectable_label(matches!(self.tool, Tool::Route(_)), "Route  X")
+                            .on_hover_text(command_tip("track.add"))
                             .clicked()
                         {
                             self.tool = Tool::Route(None);
                         }
-                        if ui.button("Sync schematic").clicked() {
+                        if ui.button("Sync schematic").on_hover_text(command_tip("board.sync")).clicked() {
                             self.run("board.sync", json!({}));
                         }
                         if ui
                             .selectable_label(matches!(self.tool, Tool::Cutout), "Circular cutout")
+                            .on_hover_text(command_tip("board.cutout.add"))
                             .clicked()
                         {
                             self.tool = Tool::Cutout;
@@ -606,18 +807,40 @@ impl App {
                     }
                     _ => {}
                 }
-                if ui.button("Move  M").clicked() {
+                if ui
+                    .selectable_label(matches!(self.tool, Tool::Move), "Move  M")
+                    .on_hover_text(
+                        "Click to drop the selected object at the cursor; press M to switch to this tool.",
+                    )
+                    .clicked()
+                {
                     self.tool = Tool::Move;
                 }
-                if ui.button("Rotate  R").clicked() {
+                if ui.button("Rotate  R").on_hover_text(command_tip("component.rotate")).clicked() {
                     self.rotate();
                 }
-                if ui.button("Fit").clicked() {
+                if ui.button("Fit").on_hover_text("Zoom the view so the whole design fits.").clicked() {
                     self.fit();
                 }
-                if ui.button("Commands  Ctrl+K").clicked() {
-                    self.command_open = !self.command_open;
+                if ui
+                    .button("Shortcuts  ?")
+                    .on_hover_text("Show every keyboard shortcut and mouse gesture in one list.")
+                    .clicked()
+                {
+                    self.shortcuts_open = !self.shortcuts_open;
                 }
+                if ui.button("Commands  Ctrl+K").on_hover_text("Search every command by name and run it, with its parameters explained.").clicked() {
+                    self.command_open = !self.command_open;
+        self.command_focus = self.command_open;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(tool_hint(&self.tool))
+                        .small()
+                        .color(self.muted()),
+                );
             });
         });
     }
@@ -672,7 +895,7 @@ impl App {
                 ui.add_space(12.0);
                 if self.palette {
                     ui.label(egui::RichText::new("Add symbol").strong());
-                    if ui.button("Browse KiCad libraries →").clicked() {
+                    if ui.button("Browse KiCad libraries →").on_hover_text("Open the library panel to browse installed symbol and footprint collections.").clicked() {
                         self.change_tab(Tab::Libraries);
                         self.palette = false;
                     }
@@ -815,18 +1038,20 @@ impl App {
                         ui.add_space(10.0);
                         ui.label("Value");
                         ui.text_edit_singleline(&mut self.value);
-                        if ui.button("Apply value").clicked() {
+                        field_help(ui, FIELD_HELP_VALUE, self.muted());
+                        if ui.button("Apply value").on_hover_text(command_tip("component.value")).clicked() {
                             self.run("component.value", json!({"id":c.id,"value":self.value}));
                         }
                         ui.add_space(12.0);
                         ui.label("Position · mm");
+                        field_help(ui, FIELD_HELP_POSITION, self.muted());
                         ui.horizontal(|ui| {
                             ui.label("X");
                             ui.add(egui::DragValue::new(&mut self.x).speed(0.1));
                             ui.label("Y");
                             ui.add(egui::DragValue::new(&mut self.y).speed(0.1));
                         });
-                        if ui.button("Apply position").clicked() {
+                        if ui.button("Apply position").on_hover_text("Move the selected symbol or footprint to the position typed above.").clicked() {
                             let mut params = json!({"id":id,"position":{"x":self.x,"y":self.y}});
                             if self.project.component(id).is_some() {
                                 params["unit"] = json!(self.selected_unit);
@@ -840,7 +1065,7 @@ impl App {
                                 params,
                             );
                         }
-                        if ui.button("Rotate 90°  R").clicked() {
+                        if ui.button("Rotate 90°  R").on_hover_text(command_tip("component.rotate")).clicked() {
                             self.rotate();
                         }
                         ui.label(
@@ -855,7 +1080,7 @@ impl App {
                                     }
                                 }),
                         );
-                        if ui.button("Assign footprint in Libraries →").clicked() {
+                        if ui.button("Assign footprint in Libraries →").on_hover_text("Jump to the library panel to bind a footprint package to this component.").clicked() {
                             self.change_tab(Tab::Libraries);
                             self.library.kind = true;
                             self.library.pending = None;
@@ -880,7 +1105,7 @@ impl App {
                         ui.label(format!("Stable ID {id}"));
                     }
                     ui.add_space(10.0);
-                    if ui.button("Delete  Del").clicked() {
+                    if ui.button("Delete  Del").on_hover_text(command_tip("object.delete")).clicked() {
                         self.run("object.delete", json!({"id":id}));
                         self.select(None);
                     }
@@ -895,6 +1120,7 @@ impl App {
                         .size(10.0)
                         .color(self.muted()),
                 );
+                field_help(ui, FIELD_HELP_BOARD, self.muted());
                 ui.horizontal(|ui| {
                     ui.label("W");
                     ui.add(
@@ -911,7 +1137,7 @@ impl App {
                             .suffix(" mm"),
                     );
                 });
-                if ui.button("Apply board dimensions").clicked() {
+                if ui.button("Apply board dimensions").on_hover_text(command_tip("board.resize")).clicked() {
                     self.run(
                         "board.resize",
                         json!({"width":self.width,"height":self.height}),
@@ -925,6 +1151,7 @@ impl App {
                             .suffix(" mm"),
                     );
                 });
+                field_help(ui, FIELD_HELP_CUTOUT, self.muted());
                 ui.add_space(12.0);
                 ui.label(egui::RichText::new("CHECKS").size(10.0).color(self.muted()));
                 let erc = self
@@ -980,24 +1207,46 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label("Project file");
                 ui.add(egui::TextEdit::singleline(&mut self.path).desired_width(260.0));
-                if ui.button("Open").clicked() {
+                if ui
+                    .button("Open")
+                    .on_hover_text("Load a saved design file from the path next to this button.")
+                    .clicked()
+                {
                     self.tool_call("open", json!({"path":self.path}));
                 }
-                if ui.button("Save").clicked() {
+                if ui
+                    .button("Save")
+                    .on_hover_text("Write the design to the file named next to this button.")
+                    .clicked()
+                {
                     self.tool_call("save", json!({"path":self.path}));
                 }
-                if ui.button("Export KiCad board").clicked() {
+                if ui
+                    .button("Export KiCad board")
+                    .on_hover_text("Write the board out so other design tools can open it.")
+                    .clicked()
+                {
                     let path = std::path::Path::new(&self.path)
                         .with_extension("kicad_pcb")
                         .to_string_lossy()
                         .into_owned();
                     self.tool_call("export", json!({"path":path,"format":"kicad_pcb"}));
                 }
-                if ui.button("LED example").clicked() {
+                if ui
+                    .button("LED example")
+                    .on_hover_text(
+                        "Start from a small worked example: a battery, resistor and LED.",
+                    )
+                    .clicked()
+                {
                     self.tool_call("sample_design", json!({}));
                     self.fit();
                 }
-                if ui.button("New project").clicked() {
+                if ui
+                    .button("New project")
+                    .on_hover_text("Start a fresh empty design.")
+                    .clicked()
+                {
                     self.tool_call("new_design", json!({}));
                     self.select(None);
                 }
@@ -1006,27 +1255,76 @@ impl App {
         if self.command_open {
             egui::Panel::bottom("commands")
                 .resizable(true)
-                .default_size(130.0)
+                .default_size(220.0)
                 .show(ui, |ui| {
+                    let query = self.command_query.clone();
+                    let matches: Vec<_> = pcbcraft_engine::commands()
+                        .into_iter()
+                        .filter(|spec| {
+                            query.is_empty()
+                                || fuzzy_match(&query, spec.id)
+                                || fuzzy_match(&query, spec.description)
+                        })
+                        .collect();
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("ENGINE COMMAND")
+                            egui::RichText::new("SEARCH")
                                 .small()
                                 .color(self.accent()),
                         );
-                        ui.text_edit_singleline(&mut self.command);
-                        ui.add(egui::TextEdit::singleline(&mut self.params).desired_width(500.0));
-                        if ui.button("Execute").clicked() {
-                            match serde_json::from_str(&self.params) {
-                                Ok(v) => self.run(&self.command.clone(), v),
-                                Err(e) => self.message = e.to_string(),
-                            }
+                        let search = ui.add(
+                            egui::TextEdit::singleline(&mut self.command_query)
+                                .hint_text("filter command names and descriptions")
+                                .desired_width(300.0),
+                        );
+                        if self.command_focus {
+                            search.request_focus();
+                            self.command_focus = false;
+                        }
+                        ui.label(
+                            egui::RichText::new("PARAMETERS")
+                                .small()
+                                .color(self.accent()),
+                        );
+                        let fields = ui.add(
+                            egui::TextEdit::singleline(&mut self.params)
+                                .hint_text("parameters as JSON")
+                                .desired_width(380.0),
+                        );
+                        if ui
+                            .button("Execute")
+                            .on_hover_text(
+                                "Run the command with the parameters you typed; selecting a command fills a starter parameter set.",
+                            )
+                            .clicked()
+                        {
+                            self.execute_palette_params();
+                        }
+                        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if enter
+                            && search.lost_focus()
+                            && let Some(spec) = matches.first()
+                        {
+                            self.command = spec.id.into();
+                            self.params = params_template(spec);
+                            fields.request_focus();
+                        } else if enter && fields.lost_focus() {
+                            self.execute_palette_params();
                         }
                     });
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} of {} commands match; click one to load it with a starter parameter set, or press Enter in the search box to load the top match",
+                            matches.len(),
+                            pcbcraft_engine::commands().len()
+                        ))
+                        .small()
+                        .color(self.muted()),
+                    );
                     egui::ScrollArea::vertical()
-                        .max_height(85.0)
+                        .max_height(180.0)
                         .show(ui, |ui| {
-                            for spec in pcbcraft_engine::commands() {
+                            for spec in matches {
                                 if ui
                                     .selectable_label(
                                         self.command == spec.id,
@@ -1035,8 +1333,26 @@ impl App {
                                     .clicked()
                                 {
                                     self.command = spec.id.into();
-                                    self.params = "{}".into();
+                                    self.params = params_template(&spec);
                                 }
+                            }
+                        });
+                });
+        }
+        if self.shortcuts_open {
+            let muted = self.muted();
+            egui::Window::new("Keyboard shortcuts")
+                .open(&mut self.shortcuts_open)
+                .show(ui, |ui| {
+                    egui::Grid::new("shortcut-list")
+                        .num_columns(3)
+                        .spacing([16.0, 4.0])
+                        .show(ui, |ui| {
+                            for (keys, action, context) in shortcut_rows() {
+                                ui.label(egui::RichText::new(keys).monospace().strong());
+                                ui.label(action);
+                                ui.label(egui::RichText::new(context).small().color(muted));
+                                ui.end_row();
                             }
                         });
                 });
@@ -1057,7 +1373,11 @@ impl App {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button("Place in schematic >").clicked() {
+                                    if ui
+                                        .button("Place in schematic >")
+                                        .on_hover_text(command_tip("component.place_library"))
+                                        .clicked()
+                                    {
                                         self.change_tab(Tab::Schematic);
                                         self.tool = Tool::Place(t.kind.into());
                                     }
@@ -1203,6 +1523,151 @@ fn pcbcraft_io_limit() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_tooltips_come_from_the_command_registry() -> Result<(), String> {
+        let registry = pcbcraft_engine::commands();
+        for id in [
+            "component.add",
+            "board.sync",
+            "board.resize",
+            "object.delete",
+        ] {
+            let want = registry
+                .iter()
+                .find(|spec| spec.id == id)
+                .map(|spec| spec.description)
+                .unwrap_or_default();
+            assert!(
+                !want.is_empty() && command_tip(id) == want,
+                "the tooltip for {id} must be the registry description"
+            );
+        }
+        assert_eq!(
+            command_tip("no.such_command"),
+            "This control runs an engine command.",
+            "an unmapped id still explains itself"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_editable_field_explains_its_bounds_and_effect() {
+        // The help copy for the inspector's free-form fields must state the
+        // same limits the engine enforces, so a novice never has to guess
+        // why a value was refused.
+        assert!(FIELD_HELP_VALUE.contains("name or value"));
+        assert!(FIELD_HELP_POSITION.contains("origin"));
+        assert!(FIELD_HELP_BOARD.contains("larger than zero"));
+        assert!(FIELD_HELP_CUTOUT.contains("inside the board"));
+    }
+
+    #[test]
+    fn shortcut_list_documents_every_binding_the_app_installs() {
+        let rows = shortcut_rows();
+        let keys: Vec<&str> = rows.iter().map(|(keys, _, _)| *keys).collect();
+        for wanted in ["Ctrl+Z", "Ctrl+K", "?", "W", "X", "Delete", "Esc"] {
+            assert!(
+                keys.contains(&wanted),
+                "the shortcut list must mention {wanted}"
+            );
+        }
+        let mut seen: Vec<&str> = keys.clone();
+        seen.sort_unstable();
+        let unique = {
+            let mut v = seen.clone();
+            v.dedup();
+            v
+        };
+        assert_eq!(seen.len(), unique.len(), "no key is listed twice");
+        for (keys, action, context) in &rows {
+            assert!(!keys.is_empty() && !action.is_empty());
+            assert!(
+                ["anywhere", "schematic tab", "pcb tab", "canvas"].contains(context),
+                "{keys} claims an unknown context {context}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_hints_name_the_next_action_for_every_tool() {
+        let select = tool_hint(&Tool::Select);
+        assert!(
+            select.contains("select") && select.contains("drag") && select.contains("zoom"),
+            "the idle hint teaches navigation: {select}"
+        );
+        let cases = [
+            (Tool::Place("resistor".into()), "symbol"),
+            (Tool::Wire(None), "first pin"),
+            (
+                Tool::Wire(Some(PinRef {
+                    component: 1,
+                    pin: "1".into(),
+                })),
+                "second pin",
+            ),
+            (Tool::Route(None), "first pad"),
+            (Tool::Route(Some((1, "1".into()))), "second pad"),
+            (Tool::Move, "drop"),
+            (Tool::Cutout, "cutout"),
+        ];
+        for (tool, verb) in cases {
+            let hint = tool_hint(&tool);
+            assert!(
+                hint.contains(verb) && hint.contains("LMB") && hint.contains("Esc"),
+                "{verb} must be spelled out for the active tool: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn palette_filtering_matches_subsequences_of_names_and_descriptions() {
+        assert!(fuzzy_match("sync", "board.sync"));
+        assert!(fuzzy_match("bre", "board.resize"));
+        assert!(fuzzy_match("PAD", "board.pad_stack"));
+        assert!(
+            !fuzzy_match("xyz", "board.sync"),
+            "characters that are not there never match"
+        );
+        assert!(
+            !fuzzy_match("copperplating", "component.value"),
+            "order matters in a subsequence"
+        );
+    }
+
+    #[test]
+    fn palette_templates_hold_exactly_the_required_parameters() -> Result<(), String> {
+        let mut checked = 0usize;
+        for spec in pcbcraft_engine::commands() {
+            let template: Value =
+                serde_json::from_str(&params_template(&spec)).map_err(|e| e.to_string())?;
+            let object = template
+                .as_object()
+                .ok_or_else(|| format!("{} template is not an object", spec.id))?;
+            let required = spec
+                .input_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                object.len(),
+                required.len(),
+                "{} template must hold exactly the required parameters",
+                spec.id
+            );
+            for key in required.iter().filter_map(Value::as_str) {
+                assert!(
+                    object.contains_key(key),
+                    "{} template misses the required parameter {key}",
+                    spec.id
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 150, "the sweep covered the whole registry");
+        Ok(())
+    }
     fn frame(
         ctx: &egui::Context,
         app: &mut App,
