@@ -134,6 +134,22 @@ pub struct Net {
     pub id: Id,
     pub name: String,
 }
+/// A named group of nets sharing one clearance requirement and one default
+/// track width. A net belongs to at most one class; nets in no class follow
+/// the board default.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NetClass {
+    pub id: Id,
+    pub name: String,
+    /// Minimum copper clearance between members of this class and other
+    /// copper, in millimetres.
+    pub clearance: f64,
+    /// Default track width for members of this class, in millimetres.
+    pub width: f64,
+    /// Nets belonging to this class.
+    #[serde(default)]
+    pub nets: Vec<Id>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PinRef {
     pub component: Id,
@@ -145,6 +161,176 @@ pub struct Wire {
     pub net: Id,
     pub from: PinRef,
     pub to: PinRef,
+}
+/// A named annotation attached to a logical net: a local, global,
+/// hierarchical or power label. Connectivity stays explicit: the label names a
+/// net that a command already assigned; it never creates a net by matching names.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Label {
+    pub id: Id,
+    /// `label`, `global`, `hierarchical`, `power` or `junction`.
+    pub kind: String,
+    /// Logical net the label names.
+    pub net: Id,
+    /// Anchor position in millimetres. A junction stores its point on a wire.
+    pub position: Point,
+    /// Text rotation in degrees, ignored for junctions.
+    pub rotation: f64,
+}
+impl Label {
+    pub const KINDS: [&'static str; 5] = ["label", "global", "hierarchical", "power", "junction"];
+}
+/// A flag marking a pin intentionally unconnected, that
+/// suppresses its unconnected-pin violation.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NoConnectFlag {
+    pub id: Id,
+    pub pin: PinRef,
+}
+/// Free-form schematic wire drawn by the user with explicit vertices.
+/// Connectivity stays explicit: `net` is assigned by a command, never inferred from crossings.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DrawnWire {
+    pub id: Id,
+    /// Logical net carried by this wire, or none until it is assigned.
+    pub net: Option<Id>,
+    /// Vertices in draw order, in millimetres.
+    pub points: Vec<Point>,
+}
+/// A free-standing drawing primitive for schematic annotations and board
+/// graphics. Shapes are explicit; nothing is inferred from geometry.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Graphic {
+    pub id: Id,
+    /// `schematic` or `board`.
+    pub layer: String,
+    /// `line`, `rect`, `circle`, `arc`, `polygon` or `text`.
+    pub shape: String,
+    /// Vertices in draw order, in millimetres. A circle stores its centre first,
+    /// an arc stores start, middle and end, and text stores its anchor.
+    pub points: Vec<Point>,
+    /// Stroke width in millimetres, circle and arc radius, or text size.
+    pub width: f64,
+    /// Text content for the text shape, empty for every other shape.
+    pub text: String,
+}
+impl Graphic {
+    /// Required vertex count for each shape, or none for an unknown shape.
+    pub fn vertex_rule(shape: &str) -> Option<(usize, usize)> {
+        match shape {
+            "line" | "rect" => Some((2, 2)),
+            "arc" => Some((3, 3)),
+            "circle" | "text" => Some((1, 1)),
+            "polygon" => Some((3, 256)),
+            _ => None,
+        }
+    }
+    /// Polyline used to render the shape, or none for text.
+    pub fn outline(&self) -> Option<Vec<Point>> {
+        let (min, _) = Self::vertex_rule(self.shape.as_str())?;
+        if self.points.len() < min {
+            return None;
+        }
+        let first = self.points.first().copied()?;
+        match self.shape.as_str() {
+            "line" => Some(self.points.clone()),
+            "rect" => {
+                let opposite = self.points.get(1).copied()?;
+                Some(vec![
+                    first,
+                    Point::new(opposite.x, first.y),
+                    opposite,
+                    Point::new(first.x, opposite.y),
+                    first,
+                ])
+            }
+            "polygon" => {
+                let mut points = self.points.clone();
+                points.push(first);
+                Some(points)
+            }
+            "circle" => {
+                let start = Point::new(first.x + self.width, first.y);
+                Some(self.arc_points(first, start, start, self.width, 0.0, 360.0))
+            }
+            "arc" => {
+                let middle = self.points.get(1).copied()?;
+                let last = self.points.get(2).copied()?;
+                let (centre, radius) = circle_through(first, middle, last)?;
+                let angle = |p: Point| (p.y - centre.y).atan2(p.x - centre.x).to_degrees();
+                let (start, mid, end) = (angle(first), angle(middle), angle(last));
+                // The middle point decides which way the arc sweeps.
+                let counter_clockwise = on_arc(start, end, mid);
+                let sweep = if counter_clockwise {
+                    wrap_360(end - start)
+                } else {
+                    wrap_360(end - start) - 360.0
+                };
+                Some(self.arc_points(centre, first, last, radius, start, sweep))
+            }
+            _ => None,
+        }
+    }
+    /// Samples a circular path without any trigonometric discontinuity at the ends:
+    /// the first and last samples are the exact supplied endpoints.
+    fn arc_points(
+        &self,
+        centre: Point,
+        start: Point,
+        end: Point,
+        radius: f64,
+        start_degrees: f64,
+        sweep_degrees: f64,
+    ) -> Vec<Point> {
+        if !radius.is_finite() || radius <= 0.0 || !sweep_degrees.is_finite() {
+            return vec![start];
+        }
+        let steps = (sweep_degrees.abs() / 15.0).ceil() as usize;
+        let steps = steps.clamp(1, 256);
+        let mut points = Vec::with_capacity(steps + 1);
+        points.push(start);
+        for step in 1..steps {
+            let angle = start_degrees + sweep_degrees * step as f64 / steps as f64;
+            let (sin, cos) = angle.to_radians().sin_cos();
+            points.push(Point::new(centre.x + radius * cos, centre.y + radius * sin));
+        }
+        points.push(end);
+        points
+    }
+}
+/// Centre and radius of the unique circle through three points, or none when the
+/// points are collinear.
+pub fn circle_through(a: Point, b: Point, c: Point) -> Option<(Point, f64)> {
+    let d = 2.0 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
+    if !d.is_finite() || d.abs() < 1e-9 {
+        return None;
+    }
+    let (a2, b2, c2) = (
+        a.x * a.x + a.y * a.y,
+        b.x * b.x + b.y * b.y,
+        c.x * c.x + c.y * c.y,
+    );
+    let centre = Point::new(
+        (a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d,
+        (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d,
+    );
+    if !centre.valid() {
+        return None;
+    }
+    let radius = centre.distance(a);
+    if !positive(radius) {
+        return None;
+    }
+    Some((centre, radius))
+}
+/// Wraps degrees into 0..360 so a sweep length can be computed.
+fn wrap_360(degrees: f64) -> f64 {
+    let value = degrees % 360.0;
+    if value < 0.0 { value + 360.0 } else { value }
+}
+/// Whether an angle lies on the counter-clockwise arc from start to end.
+fn on_arc(start: f64, end: f64, test: f64) -> bool {
+    wrap_360(test - start) <= wrap_360(end - start)
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Pad {
@@ -309,6 +495,35 @@ pub struct Track {
     pub width: f64,
     pub layer: Layer,
 }
+/// A plated through-hole via joining the front and back copper layers. A via
+/// is one physical pad plated through the board, so it conducts on both layers.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Via {
+    pub id: Id,
+    pub net: Id,
+    /// Centre position in millimetres.
+    pub position: Point,
+    /// Outer copper pad diameter in millimetres.
+    pub diameter: f64,
+    /// Drilled hole diameter in millimetres; zero keeps an unplated blind hole.
+    pub drill: f64,
+}
+/// A solid copper region on one layer, bounded by a closed polygon and
+/// belonging to a net. Same-net copper that falls inside the outline conducts
+/// to the zone; the zone keeps its clearance from copper of other nets.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CopperZone {
+    pub id: Id,
+    pub net: Id,
+    pub layer: Layer,
+    /// Closed outline in millimetres: at least three distinct vertices with the
+    /// first vertex repeated last.
+    pub outline: Vec<Point>,
+    /// Closed outlines removed from this zone: copper of other nets, or empty
+    /// board, inside a cutout never conducts through the zone.
+    #[serde(default)]
+    pub cutouts: Vec<Vec<Point>>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Cutout {
     pub id: Id,
@@ -323,6 +538,12 @@ pub struct Board {
     pub clearance: f64,
     pub footprints: Vec<Footprint>,
     pub tracks: Vec<Track>,
+    /// Plated through-hole vias joining front and back copper.
+    #[serde(default)]
+    pub vias: Vec<Via>,
+    /// Poured copper zones, one polygon per zone on a single layer.
+    #[serde(default)]
+    pub zones: Vec<CopperZone>,
     pub cutouts: Vec<Cutout>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -332,7 +553,21 @@ pub struct Project {
     pub name: String,
     pub components: Vec<Component>,
     pub nets: Vec<Net>,
+    /// Named net classes carrying clearance and default width rules.
+    #[serde(default)]
+    pub net_classes: Vec<NetClass>,
     pub wires: Vec<Wire>,
+    #[serde(default)]
+    pub drawn_wires: Vec<DrawnWire>,
+    /// Free-standing drawing primitives for schematic and board graphics.
+    #[serde(default)]
+    pub graphics: Vec<Graphic>,
+    /// Named net annotations placed on the schematic.
+    #[serde(default)]
+    pub labels: Vec<Label>,
+    /// Pins explicitly marked unconnected.
+    #[serde(default)]
+    pub no_connects: Vec<NoConnectFlag>,
     pub board: Board,
     #[serde(default)]
     pub library: ProjectLibrary,
@@ -370,6 +605,27 @@ impl ProjectLibrary {
         Ok(())
     }
 }
+/// A closed polygon outline: 3-256 distinct vertices, the first repeated last,
+/// finite in-range coordinates and nonzero enclosed area.
+pub fn validate_closed_outline(outline: &[Point]) -> Result<(), String> {
+    if outline.len() < 4 || outline.len() > 257 {
+        return Err("a zone outline needs 3 to 256 vertices".into());
+    }
+    if outline.first() != outline.last() {
+        return Err("zone outline must be closed".into());
+    }
+    if !outline.iter().all(|pt| pt.valid()) {
+        return Err("zone outline vertex is out of range".into());
+    }
+    let mut area = 0.0;
+    for edge in outline.windows(2) {
+        area += edge[0].x * edge[1].y - edge[1].x * edge[0].y;
+    }
+    if area.abs() < 1e-6 {
+        return Err("zone outline has no area".into());
+    }
+    Ok(())
+}
 impl Default for Project {
     fn default() -> Self {
         Self {
@@ -379,7 +635,12 @@ impl Default for Project {
             name: "Untitled circuit".into(),
             components: vec![],
             nets: vec![],
+            net_classes: vec![],
             wires: vec![],
+            drawn_wires: vec![],
+            graphics: vec![],
+            labels: vec![],
+            no_connects: vec![],
             board: Board {
                 width: 60.0,
                 height: 40.0,
@@ -387,6 +648,8 @@ impl Default for Project {
                 clearance: 0.2,
                 footprints: vec![],
                 tracks: vec![],
+                vias: vec![],
+                zones: vec![],
                 cutouts: vec![],
             },
         }
@@ -505,14 +768,38 @@ impl Project {
             .map(|n| n.name.as_str())
             .unwrap_or("unassigned")
     }
+    /// The net class a net belongs to, if it belongs to one.
+    pub fn net_class(&self, net: Id) -> Option<&NetClass> {
+        self.net_classes.iter().find(|c| c.nets.contains(&net))
+    }
+    /// Minimum clearance required between copper on `a` and copper on `b`:
+    /// the board default, raised by the class of either net when classified.
+    pub fn required_clearance(&self, a: Id, b: Id) -> f64 {
+        [a, b]
+            .iter()
+            .map(|net| {
+                self.net_class(*net)
+                    .map(|c| c.clearance)
+                    .unwrap_or(self.board.clearance)
+            })
+            .max_by(f64::total_cmp)
+            .unwrap_or(self.board.clearance)
+    }
     pub fn ids(&self) -> impl Iterator<Item = Id> + '_ {
         self.components
             .iter()
             .map(|x| x.id)
             .chain(self.nets.iter().map(|x| x.id))
+            .chain(self.net_classes.iter().map(|x| x.id))
             .chain(self.wires.iter().map(|x| x.id))
+            .chain(self.drawn_wires.iter().map(|x| x.id))
+            .chain(self.graphics.iter().map(|x| x.id))
+            .chain(self.labels.iter().map(|x| x.id))
+            .chain(self.no_connects.iter().map(|x| x.id))
             .chain(self.board.footprints.iter().map(|x| x.id))
             .chain(self.board.tracks.iter().map(|x| x.id))
+            .chain(self.board.vias.iter().map(|x| x.id))
+            .chain(self.board.zones.iter().map(|x| x.id))
             .chain(self.board.cutouts.iter().map(|x| x.id))
     }
     pub fn validate(&self) -> Result<(), String> {
@@ -557,6 +844,31 @@ impl Project {
         for n in &self.nets {
             if n.name.is_empty() || n.name.len() > 128 || !names.insert(&n.name) {
                 return Err("invalid or duplicate net name".into());
+            }
+        }
+        if self.net_classes.len() > 64 {
+            return Err("net class limit reached (64)".into());
+        }
+        let mut class_names = BTreeSet::new();
+        let mut classified: BTreeSet<Id> = BTreeSet::new();
+        for c in &self.net_classes {
+            if c.name.is_empty()
+                || c.name.len() > 128
+                || !class_names.insert(&c.name)
+                || c.nets.len() > 256
+                || !c.clearance.is_finite()
+                || c.clearance <= 0.0
+                || c.clearance > 100.0
+                || !c.width.is_finite()
+                || c.width <= 0.0
+                || c.width > 100.0
+            {
+                return Err("invalid net class".into());
+            }
+            for net in &c.nets {
+                if !nets.contains(net) || !classified.insert(*net) {
+                    return Err("net class membership is invalid".into());
+                }
             }
         }
         let mut refs = BTreeSet::new();
@@ -663,6 +975,96 @@ impl Project {
                 return Err("wire has inconsistent pin/net references".into());
             }
         }
+        for w in &self.drawn_wires {
+            if w.net.is_some_and(|net| !nets.contains(&net)) {
+                return Err("drawn wire references an unknown net".into());
+            }
+            if w.points.len() < 2 || w.points.len() > 256 {
+                return Err("drawn wire needs 2–256 vertices".into());
+            }
+            if !w.points.iter().all(|p| p.valid()) {
+                return Err("drawn wire has an out-of-range vertex".into());
+            }
+            if w.points.windows(2).any(|p| p[0] == p[1]) {
+                return Err("drawn wire repeats a vertex".into());
+            }
+        }
+        for g in &self.graphics {
+            if g.layer != "schematic" && g.layer != "board" {
+                return Err("graphic layer must be schematic or board".into());
+            }
+            let (min, max) = match Graphic::vertex_rule(&g.shape) {
+                Some(rule) => rule,
+                None => return Err("unknown graphic shape".into()),
+            };
+            if g.points.len() < min || g.points.len() > max {
+                return Err("graphic has the wrong number of vertices for its shape".into());
+            }
+            if !g.points.iter().all(|p| p.valid()) {
+                return Err("graphic has an out-of-range vertex".into());
+            }
+            if !positive(g.width) {
+                return Err("graphic width, radius or text size must be positive".into());
+            }
+            if g.text.len() > 1024 {
+                return Err("graphic text is too long".into());
+            }
+            if (g.shape == "text") != !g.text.is_empty() {
+                return Err("only text graphics may carry text".into());
+            }
+            if g.shape == "line" && g.points[0] == g.points[1] {
+                return Err("line graphic has no length".into());
+            }
+            if g.shape == "rect"
+                && (g.points[0].x == g.points[1].x || g.points[0].y == g.points[1].y)
+            {
+                return Err("rect graphic has no area".into());
+            }
+            if g.shape == "arc" && circle_through(g.points[0], g.points[1], g.points[2]).is_none() {
+                return Err("arc graphic vertices are collinear".into());
+            }
+            if g.shape == "circle"
+                && g.points[0] == Point::new(g.points[0].x + g.width, g.points[0].y)
+            {
+                return Err("circle graphic has zero radius".into());
+            }
+        }
+        for l in &self.labels {
+            if !Label::KINDS.iter().any(|k| *k == l.kind) {
+                return Err("unknown label kind".into());
+            }
+            if !self.nets.iter().any(|n| n.id == l.net) {
+                return Err("label references an unknown net".into());
+            }
+            if !l.position.valid() {
+                return Err("label position is out of range".into());
+            }
+            if !l.rotation.is_finite() || l.rotation.abs() > 360_000.0 {
+                return Err("invalid label rotation".into());
+            }
+            if l.kind == "junction"
+                && !self
+                    .drawn_wires
+                    .iter()
+                    .any(|w| w.net == Some(l.net) && w.points.contains(&l.position))
+            {
+                return Err("junction must sit on a vertex of a drawn wire of its net".into());
+            }
+        }
+        for f in &self.no_connects {
+            let Some(c) = self.component(f.pin.component) else {
+                return Err("no-connect flag references an unknown component".into());
+            };
+            if !c.pins.iter().any(|p| p.number == f.pin.pin) {
+                return Err("no-connect flag references an unknown pin".into());
+            }
+            if self.wires.iter().any(|w| {
+                (w.from.component == f.pin.component && w.from.pin == f.pin.pin)
+                    || (w.to.component == f.pin.component && w.to.pin == f.pin.pin)
+            }) {
+                return Err("no-connect flag conflicts with a connected pin".into());
+            }
+        }
         let b = &self.board;
         if !positive(b.width)
             || !positive(b.height)
@@ -754,6 +1156,26 @@ impl Project {
                 || t.start.distance(t.end) < 1e-6
             {
                 return Err("invalid track geometry or net".into());
+            }
+        }
+        for v in &b.vias {
+            if !nets.contains(&v.net)
+                || !v.position.valid()
+                || !positive(v.diameter)
+                || v.diameter > 100.0
+                || v.drill < 0.0
+                || v.drill >= v.diameter
+            {
+                return Err("invalid via geometry or net".into());
+            }
+        }
+        for z in &b.zones {
+            if !nets.contains(&z.net) {
+                return Err("zone references an unknown net".into());
+            }
+            validate_closed_outline(&z.outline)?;
+            for cut in &z.cutouts {
+                validate_closed_outline(cut)?;
             }
         }
         for c in &b.cutouts {
