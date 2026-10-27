@@ -128,6 +128,72 @@ pub fn commands() -> Vec<CommandSpec> {
             ),
         ),
         (
+            "wire.draw",
+            "Draw a free-form schematic wire with explicit vertices, optionally bound to a net",
+            schema(
+                json!({"points":{"type":"array","items":point_schema(),"minItems":2,"maxItems":256},"net":id_schema()}),
+                &["points"],
+            ),
+        ),
+        (
+            "wire.split",
+            "Split a drawn wire into two at a point on one of its segments",
+            schema(json!({"id":id_schema(),"at":point_schema()}), &["id", "at"]),
+        ),
+        (
+            "graphic.add",
+            "Add a free-standing schematic or board graphic: line, rect, circle, arc, polygon or text",
+            schema(
+                json!({"layer":{"type":"string","enum":["schematic","board"]},"shape":{"type":"string","enum":["line","rect","circle","arc","polygon","text"]},"points":{"type":"array","items":point_schema(),"minItems":1,"maxItems":256},"width":{"type":"number","exclusiveMinimum":0,"maximum":1000},"text":{"type":"string","maxLength":1024}}),
+                &["layer", "shape", "points", "width"],
+            ),
+        ),
+        (
+            "label.place",
+            "Place a local, global, hierarchical or power label, or a junction, naming an existing net",
+            schema(
+                json!({"kind":{"type":"string","enum":["label","global","hierarchical","power","junction"]},"net":id_schema(),"position":point_schema(),"rotation":{"type":"number","minimum":-360000.0,"maximum":360000.0}}),
+                &["kind", "net", "position"],
+            ),
+        ),
+        (
+            "pin.no_connect",
+            "Mark a pin intentionally unconnected, suppressing its unconnected-pin violation",
+            schema(json!({"pin":pin_schema()}), &["pin"]),
+        ),
+        (
+            "via.place",
+            "Place a plated through-hole via joining front and back copper on an existing net",
+            schema(
+                json!({"net":id_schema(),"position":point_schema(),"diameter":{"type":"number","exclusiveMinimum":0,"maximum":100},"drill":{"type":"number","minimum":0,"maximum":100,"description":"drilled hole diameter, millimetres"}}),
+                &["net", "position", "diameter"],
+            ),
+        ),
+        (
+            "via.stitch",
+            "Fill a rectangular area with a grid of stitched vias on an existing net",
+            schema(
+                json!({"net":id_schema(),"bounds":schema(json!({"x":{"type":"number"},"y":{"type":"number"},"width":{"type":"number","exclusiveMinimum":0},"height":{"type":"number","exclusiveMinimum":0}}),&["x","y","width","height"]),"spacing":{"type":"number","minimum":0.5,"maximum":50,"description":"grid pitch, millimetres"},"diameter":{"type":"number","exclusiveMinimum":0,"maximum":100},"drill":{"type":"number","minimum":0,"maximum":100,"description":"drilled hole diameter, millimetres"}}),
+                &["net", "bounds", "diameter"],
+            ),
+        ),
+        (
+            "zone.place",
+            "Place a poured copper zone: a closed polygon of copper on one layer bound to an existing net",
+            schema(
+                json!({"net":id_schema(),"layer":{"type":"string","enum":["F.Cu","B.Cu"]},"outline":{"type":"array","minItems":4,"maxItems":257,"items":point_schema(),"description":"closed polygon, millimetres; first vertex repeated last"}}),
+                &["net", "outline"],
+            ),
+        ),
+        (
+            "zone.cutout",
+            "Add a closed cutout outline that removes copper from an existing zone",
+            schema(
+                json!({"zone":id_schema(),"outline":{"type":"array","minItems":4,"maxItems":257,"items":point_schema(),"description":"closed polygon, millimetres; first vertex repeated last"}}),
+                &["zone", "outline"],
+            ),
+        ),
+        (
             "board.sync",
             "Reconcile schematic components and pin nets into PCB footprints; retain placements and report unassigned library symbols",
             schema(json!({}), &[]),
@@ -181,6 +247,11 @@ pub fn commands() -> Vec<CommandSpec> {
             ),
         ),
         (
+            "track.split",
+            "Split one copper segment into two at a point on the track",
+            schema(json!({"id":id_schema(),"at":point_schema()}), &["id", "at"]),
+        ),
+        (
             "track.route",
             "Connect same-net pads on the chosen copper layer with an orthogonal route (not shove routing)",
             schema(
@@ -189,8 +260,16 @@ pub fn commands() -> Vec<CommandSpec> {
             ),
         ),
         (
+            "align.distribute",
+            "Align or evenly distribute components or board footprints along an axis",
+            schema(
+                json!({"ids":{"type":"array","minItems":2,"maxItems":128,"items":id_schema()},"mode":{"type":"string","enum":["left","center_x","right","top","center_y","bottom","distribute_x","distribute_y"]}}),
+                &["ids", "mode"],
+            ),
+        ),
+        (
             "object.delete",
-            "Delete a component, wire, track, footprint, cutout or unused net by stable ID",
+            "Delete a component, wire, track, via, zone, footprint, cutout or unused net by stable ID",
             schema(json!({"id":id_schema()}), &["id"]),
         ),
     ];
@@ -309,10 +388,10 @@ impl Session {
         Ok(json!({"revision":self.revision}))
     }
     pub fn inspect(&self) -> Value {
-        json!({"revision":self.revision,"project":self.project,"history":{"undo":self.undo.len(),"redo":self.redo.len()},"capabilities":{"schematic":"flat explicit pin nets; embedded multi-unit packages with independent unit placement and one physical pin map","pcb":"front SMD and plated through-hole circle/rect/roundrect/oval pads, circular/oval offset drills; two copper layers, simple tracks, rectangular outline and circular cutouts","library":"native project-library symbol/footprint authoring, reusable .pcbcraft-lib collections, embedded placed copies","checks":"initial pin assignment and conservative copper bounds with same-pad plated layer bridges and drilled-hole contact tests; not comprehensive ERC/DRC","kicad":"native library reading and limited PCB export; no general project import or library writer","routing":"orthogonal routes on chosen copper layer; no obstacle avoidance or shove","3d":false}})
+        json!({"revision":self.revision,"project":self.project,"history":{"undo":self.undo.len(),"redo":self.redo.len()},"capabilities":{"schematic":"flat explicit pin nets with named net labels, junctions and no-connect flags; embedded multi-unit packages with independent unit placement and one physical pin map","pcb":"front SMD and plated through-hole circle/rect/roundrect/oval pads, circular/oval offset drills; two copper layers, simple tracks, plated through-hole vias including stitch grids, poured copper zones with cutouts, rectangular outline and circular cutouts","library":"native project-library symbol/footprint authoring, reusable .pcbcraft-lib collections, embedded placed copies","checks":"initial pin assignment with no-connect flag suppression and conservative copper bounds with same-pad plated layer bridges and drilled-hole contact tests; not comprehensive ERC/DRC","kicad":"native library reading and limited PCB export; no general project import or library writer","routing":"orthogonal routes on chosen copper layer; no obstacle avoidance or shove","3d":false}})
     }
     pub fn checks(&self) -> Value {
-        json!({"revision":self.revision,"erc":pcbcraft_rules::erc(&self.project),"drc":pcbcraft_rules::drc(&self.project),"airwires":pcbcraft_rules::airwires(&self.project),"scope":"Initial checks: pin assignment, net population, capsule tracks, rectangular edge and circular cutout clearance. Noncircular pads use sampled convex outlines with conservative chord-error clearance and inscribed connectivity bounds. Plated pads bridge the same physical pad between F.Cu/B.Cu; traces wholly inside circular/oval drills do not contact copper. Conservative false findings remain possible. No comprehensive pin-type, annular-ring manufacturing rules, vias, zones or hierarchy checks."})
+        json!({"revision":self.revision,"erc":pcbcraft_rules::erc(&self.project),"drc":pcbcraft_rules::drc(&self.project),"airwires":pcbcraft_rules::airwires(&self.project),"scope":"Initial checks: pin assignment (suppressed for pins flagged no-connect), net population, capsule tracks, rectangular edge and circular cutout clearance. Noncircular pads use sampled convex outlines with conservative chord-error clearance and inscribed connectivity bounds. Plated pads bridge the same physical pad between F.Cu/B.Cu; traces wholly inside circular/oval drills do not contact copper. Conservative false findings remain possible. No comprehensive pin-type, annular-ring manufacturing rules, zones or hierarchy checks."})
     }
     pub fn sample() -> Result<Self, Error> {
         let mut s = Self::default();
@@ -531,6 +610,101 @@ struct WireParams {
     net: Option<Id>,
     from: PinRef,
     to: PinRef,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DrawnWireParams {
+    points: Vec<Point>,
+    net: Option<Id>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphicParams {
+    layer: String,
+    shape: String,
+    points: Vec<Point>,
+    width: f64,
+    #[serde(default)]
+    text: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LabelParams {
+    kind: String,
+    net: Id,
+    position: Point,
+    #[serde(default)]
+    rotation: f64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoConnectParams {
+    pin: PinRef,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ViaParams {
+    net: Id,
+    position: Point,
+    diameter: f64,
+    #[serde(default)]
+    drill: f64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ZoneParams {
+    net: Id,
+    #[serde(default = "front")]
+    layer: Layer,
+    outline: Vec<Point>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ZoneCutoutParams {
+    zone: Id,
+    outline: Vec<Point>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StitchBounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StitchParams {
+    net: Id,
+    bounds: StitchBounds,
+    diameter: f64,
+    #[serde(default)]
+    drill: f64,
+    #[serde(default = "default_stitch_spacing")]
+    spacing: f64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SplitParams {
+    id: Id,
+    at: Point,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AlignParams {
+    ids: Vec<Id>,
+    mode: String,
+}
+/// Center of an align item's bounding box on the requested axis.
+fn align_center(item: (Id, bool, f64, f64, f64, f64), axis_x: bool) -> f64 {
+    if axis_x {
+        (item.2 + item.4) / 2.0
+    } else {
+        (item.3 + item.5) / 2.0
+    }
+}
+fn default_stitch_spacing() -> f64 {
+    1.0
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -808,6 +982,289 @@ fn run(p: &mut Project, next: &mut Id, command: &str, params: &Value) -> Result<
             });
             Ok(json!({"id":id,"net":net}))
         }
+        "wire.draw" => {
+            let a: DrawnWireParams = parse(params)?;
+            if a.points.len() < 2 || a.points.len() > 256 {
+                return Err(Error::Invalid("wire needs 2–256 vertices".into()));
+            }
+            if !a.points.iter().all(|p| p.valid()) {
+                return Err(Error::Invalid("wire vertex is out of range".into()));
+            }
+            if a.points.windows(2).any(|w| w[0] == w[1]) {
+                return Err(Error::Invalid("wire repeats a vertex".into()));
+            }
+            if a.net.is_some_and(|net| !p.nets.iter().any(|n| n.id == net)) {
+                return Err(missing());
+            }
+            let id = allocate(next)?;
+            let vertices = a.points.len();
+            p.drawn_wires.push(DrawnWire {
+                id,
+                net: a.net,
+                points: a.points,
+            });
+            Ok(json!({"id":id,"vertices":vertices}))
+        }
+        "wire.split" => {
+            let a: SplitParams = parse(params)?;
+            if !a.at.valid() {
+                return Err(Error::Invalid("split point is out of range".into()));
+            }
+            let index = p
+                .drawn_wires
+                .iter()
+                .position(|w| w.id == a.id)
+                .ok_or_else(missing)?;
+            let wire = &p.drawn_wires[index];
+            let segment = (0..wire.points.len() - 1)
+                .find(|i| {
+                    let (from, to) = (wire.points[*i], wire.points[*i + 1]);
+                    a.at.distance(from) >= 0.01
+                        && a.at.distance(to) >= 0.01
+                        && pcbcraft_geom::point_segment(a.at, from, to) <= 1e-4
+                })
+                .ok_or_else(|| {
+                    Error::Invalid(
+                        "split point must lie on a wire segment, clear of its vertices".into(),
+                    )
+                })?;
+            let id = allocate(next)?;
+            let net = wire.net;
+            let mut head = wire.points[..=segment].to_vec();
+            head.push(a.at);
+            let mut tail = vec![a.at];
+            tail.extend_from_slice(&wire.points[segment + 1..]);
+            p.drawn_wires[index].points = head;
+            p.drawn_wires.push(DrawnWire {
+                id,
+                net,
+                points: tail,
+            });
+            Ok(json!({"id":id,"kept":a.id}))
+        }
+        "graphic.add" => {
+            let a: GraphicParams = parse(params)?;
+            if a.layer != "schematic" && a.layer != "board" {
+                return Err(Error::Invalid(
+                    "graphic layer must be schematic or board".into(),
+                ));
+            }
+            let (min, max) = match pcbcraft_doc::Graphic::vertex_rule(&a.shape) {
+                Some(rule) => rule,
+                None => return Err(Error::Invalid("unknown graphic shape".into())),
+            };
+            if a.points.len() < min || a.points.len() > max {
+                return Err(Error::Invalid(
+                    "graphic has the wrong number of vertices for its shape".into(),
+                ));
+            }
+            if !a.points.iter().all(|p| p.valid()) {
+                return Err(Error::Invalid("graphic vertex is out of range".into()));
+            }
+            if !a.width.is_finite() || a.width <= 0.0 || a.width > 1_000.0 {
+                return Err(Error::Invalid(
+                    "graphic width, radius or text size must be within 0–1000mm".into(),
+                ));
+            }
+            if a.text.len() > 1024 {
+                return Err(Error::Invalid("graphic text is too long".into()));
+            }
+            if (a.shape == "text") != !a.text.is_empty() {
+                return Err(Error::Invalid("only text graphics may carry text".into()));
+            }
+            let id = allocate(next)?;
+            p.graphics.push(pcbcraft_doc::Graphic {
+                id,
+                layer: a.layer,
+                shape: a.shape,
+                points: a.points,
+                width: a.width,
+                text: a.text,
+            });
+            Ok(json!({"id":id}))
+        }
+        "label.place" => {
+            let a: LabelParams = parse(params)?;
+            if !pcbcraft_doc::Label::KINDS.iter().any(|k| *k == a.kind) {
+                return Err(Error::Invalid("unknown label kind".into()));
+            }
+            if !p.nets.iter().any(|n| n.id == a.net) {
+                return Err(missing());
+            }
+            if !a.position.valid() {
+                return Err(Error::Invalid("label position is out of range".into()));
+            }
+            if !a.rotation.is_finite() || a.rotation.abs() > 360_000.0 {
+                return Err(Error::Invalid("invalid label rotation".into()));
+            }
+            if a.kind == "junction"
+                && !p
+                    .drawn_wires
+                    .iter()
+                    .any(|w| w.net == Some(a.net) && w.points.contains(&a.position))
+            {
+                return Err(Error::Invalid(
+                    "junction must sit on a vertex of a drawn wire of its net".into(),
+                ));
+            }
+            let id = allocate(next)?;
+            p.labels.push(pcbcraft_doc::Label {
+                id,
+                kind: a.kind,
+                net: a.net,
+                position: a.position,
+                rotation: a.rotation,
+            });
+            Ok(json!({"id":id}))
+        }
+        "pin.no_connect" => {
+            let a: NoConnectParams = parse(params)?;
+            if !p
+                .component(a.pin.component)
+                .is_some_and(|c| c.pins.iter().any(|pin| pin.number == a.pin.pin))
+            {
+                return Err(missing());
+            }
+            let component = a.pin.component;
+            let connected = p.wires.iter().any(|w| {
+                (w.from.component == component && w.from.pin == a.pin.pin)
+                    || (w.to.component == component && w.to.pin == a.pin.pin)
+            });
+            if connected {
+                return Err(Error::Invalid(
+                    "no-connect flag conflicts with a connected pin".into(),
+                ));
+            }
+            let duplicate = p
+                .no_connects
+                .iter()
+                .any(|f| f.pin.component == a.pin.component && f.pin.pin == a.pin.pin);
+            if duplicate {
+                return Err(Error::Invalid("pin already has a no-connect flag".into()));
+            }
+            let id = allocate(next)?;
+            p.no_connects
+                .push(pcbcraft_doc::NoConnectFlag { id, pin: a.pin });
+            Ok(json!({"id":id}))
+        }
+        "via.place" => {
+            let a: ViaParams = parse(params)?;
+            if !p.nets.iter().any(|n| n.id == a.net) {
+                return Err(missing());
+            }
+            if !a.position.valid() {
+                return Err(Error::Invalid("via position is out of range".into()));
+            }
+            if !a.diameter.is_finite() || a.diameter <= 0.0 || a.diameter > 100.0 {
+                return Err(Error::Invalid("via diameter must be within 0–100mm".into()));
+            }
+            if !a.drill.is_finite() || a.drill < 0.0 || a.drill >= a.diameter {
+                return Err(Error::Invalid(
+                    "via drill must be smaller than its pad".into(),
+                ));
+            }
+            let id = allocate(next)?;
+            p.board.vias.push(pcbcraft_doc::Via {
+                id,
+                net: a.net,
+                position: a.position,
+                diameter: a.diameter,
+                drill: a.drill,
+            });
+            Ok(json!({"id":id}))
+        }
+        "via.stitch" => {
+            let a: StitchParams = parse(params)?;
+            if !p.nets.iter().any(|n| n.id == a.net) {
+                return Err(missing());
+            }
+            if !a.diameter.is_finite() || a.diameter <= 0.0 || a.diameter > 100.0 {
+                return Err(Error::Invalid("via diameter must be within 0–100mm".into()));
+            }
+            if !a.drill.is_finite() || a.drill < 0.0 || a.drill >= a.diameter {
+                return Err(Error::Invalid(
+                    "via drill must be smaller than its pad".into(),
+                ));
+            }
+            if !a.spacing.is_finite() || !(0.5..=50.0).contains(&a.spacing) {
+                return Err(Error::Invalid(
+                    "stitch spacing must be within 0.5–50mm".into(),
+                ));
+            }
+            let b = &a.bounds;
+            if !b.x.is_finite()
+                || !b.y.is_finite()
+                || !b.width.is_finite()
+                || !b.height.is_finite()
+                || b.x < 0.0
+                || b.y < 0.0
+                || b.width <= 0.0
+                || b.height <= 0.0
+                || b.x + b.width > p.board.width
+                || b.y + b.height > p.board.height
+            {
+                return Err(Error::Invalid(
+                    "stitch bounds must lie inside the board".into(),
+                ));
+            }
+            let columns = (b.width / a.spacing).floor() as i64 + 1;
+            let rows = (b.height / a.spacing).floor() as i64 + 1;
+            if columns * rows > 4096 {
+                return Err(Error::Invalid(
+                    "a stitch grid is limited to 4096 vias".into(),
+                ));
+            }
+            let mut ids = vec![];
+            for row in 0..rows {
+                for column in 0..columns {
+                    let position = Point::new(
+                        b.x + (column as f64 + 0.5) * a.spacing,
+                        b.y + (row as f64 + 0.5) * a.spacing,
+                    );
+                    if !position.valid() {
+                        return Err(Error::Invalid("stitch via position is out of range".into()));
+                    }
+                    let id = allocate(next)?;
+                    p.board.vias.push(pcbcraft_doc::Via {
+                        id,
+                        net: a.net,
+                        position,
+                        diameter: a.diameter,
+                        drill: a.drill,
+                    });
+                    ids.push(id);
+                }
+            }
+            Ok(json!({"count": ids.len(), "ids": ids}))
+        }
+        "zone.place" => {
+            let a: ZoneParams = parse(params)?;
+            if !p.nets.iter().any(|n| n.id == a.net) {
+                return Err(missing());
+            }
+            validate_closed_outline(&a.outline).map_err(Error::Invalid)?;
+            let id = allocate(next)?;
+            p.board.zones.push(pcbcraft_doc::CopperZone {
+                id,
+                net: a.net,
+                layer: a.layer,
+                outline: a.outline,
+                cutouts: vec![],
+            });
+            Ok(json!({"id":id}))
+        }
+        "zone.cutout" => {
+            let a: ZoneCutoutParams = parse(params)?;
+            let zone = p
+                .board
+                .zones
+                .iter_mut()
+                .find(|z| z.id == a.zone)
+                .ok_or_else(missing)?;
+            validate_closed_outline(&a.outline).map_err(Error::Invalid)?;
+            zone.cutouts.push(a.outline);
+            Ok(json!({"cutouts": zone.cutouts.len()}))
+        }
         "board.sync" => {
             if params.as_object().is_none_or(|m| !m.is_empty()) {
                 return Err(Error::Invalid("board.sync takes an empty object".into()));
@@ -905,6 +1362,39 @@ fn run(p: &mut Project, next: &mut Id, command: &str, params: &Value) -> Result<
             });
             Ok(json!({"id":id}))
         }
+        "track.split" => {
+            let a: SplitParams = parse(params)?;
+            if !a.at.valid() {
+                return Err(Error::Invalid("split point is out of range".into()));
+            }
+            let index = p
+                .board
+                .tracks
+                .iter()
+                .position(|t| t.id == a.id)
+                .ok_or_else(missing)?;
+            let track = &p.board.tracks[index];
+            if a.at.distance(track.start) < 0.01 || a.at.distance(track.end) < 0.01 {
+                return Err(Error::Invalid(
+                    "split point must sit clear of both track ends".into(),
+                ));
+            }
+            if pcbcraft_geom::point_segment(a.at, track.start, track.end) > 1e-4 {
+                return Err(Error::Invalid("split point must lie on the track".into()));
+            }
+            let id = allocate(next)?;
+            let (net, width, layer, end) = (track.net, track.width, track.layer, track.end);
+            p.board.tracks[index].end = a.at;
+            p.board.tracks.push(Track {
+                id,
+                net,
+                start: a.at,
+                end,
+                width,
+                layer,
+            });
+            Ok(json!({"id":id,"kept":a.id}))
+        }
         "track.route" => {
             let a: Route = parse(params)?;
             let (start, net) = pad(p, &a.from, a.layer)?;
@@ -932,6 +1422,143 @@ fn run(p: &mut Project, next: &mut Id, command: &str, params: &Value) -> Result<
             }
             Ok(json!({"ids":ids,"net":net}))
         }
+        "align.distribute" => {
+            let a: AlignParams = parse(params)?;
+            let mode = a.mode.as_str();
+            if a.ids.len() < 2 {
+                return Err(Error::Invalid("alignment needs at least two items".into()));
+            }
+            if !matches!(
+                mode,
+                "left"
+                    | "center_x"
+                    | "right"
+                    | "top"
+                    | "center_y"
+                    | "bottom"
+                    | "distribute_x"
+                    | "distribute_y"
+            ) {
+                return Err(Error::Invalid("unknown alignment mode".into()));
+            }
+            let mut seen: Vec<Id> = vec![];
+            let mut items: Vec<(Id, bool, f64, f64, f64, f64)> = vec![];
+            for id in &a.ids {
+                if seen.contains(id) {
+                    continue;
+                }
+                seen.push(*id);
+                let points: Vec<Point> = if let Some(c) = p.component(*id) {
+                    c.schematic_views()
+                        .iter()
+                        .flat_map(|view| {
+                            view.drawing_points()
+                                .into_iter()
+                                .map(move |point| point.rotate(view.rotation).offset(view.position))
+                        })
+                        .collect()
+                } else if let Some(f) = p.footprint(*id) {
+                    f.drawing_points(p)
+                        .into_iter()
+                        .map(|point| point.rotate(f.rotation).offset(f.position))
+                        .collect()
+                } else {
+                    return Err(missing());
+                };
+                if points.is_empty() {
+                    return Err(Error::Invalid("item has no drawing outline".into()));
+                }
+                let min = points
+                    .iter()
+                    .fold(Point::new(f64::INFINITY, f64::INFINITY), |m, point| {
+                        Point::new(m.x.min(point.x), m.y.min(point.y))
+                    });
+                let max = points.iter().fold(
+                    Point::new(f64::NEG_INFINITY, f64::NEG_INFINITY),
+                    |m, point| Point::new(m.x.max(point.x), m.y.max(point.y)),
+                );
+                items.push((*id, p.footprint(*id).is_some(), min.x, min.y, max.x, max.y));
+            }
+            let left = items.iter().map(|i| i.2).fold(f64::INFINITY, f64::min);
+            let top = items.iter().map(|i| i.3).fold(f64::INFINITY, f64::min);
+            let right = items.iter().map(|i| i.4).fold(f64::NEG_INFINITY, f64::max);
+            let bottom = items.iter().map(|i| i.5).fold(f64::NEG_INFINITY, f64::max);
+            if !(left.is_finite() && top.is_finite() && right.is_finite() && bottom.is_finite()) {
+                return Err(Error::Invalid("item outlines are out of range".into()));
+            }
+            let mut plan: Vec<(Id, bool, f64, f64)> = vec![];
+            if mode == "distribute_x" || mode == "distribute_y" {
+                let axis_x = mode == "distribute_x";
+                let mut order: Vec<usize> = (0..items.len()).collect();
+                order.sort_by(|a, b| {
+                    let ca = align_center(items[*a], axis_x);
+                    let cb = align_center(items[*b], axis_x);
+                    ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let first = align_center(items[order[0]], axis_x);
+                let last = align_center(items[*order.last().ok_or_else(missing)?], axis_x);
+                let steps = order.len() - 1;
+                for (step, item) in order.iter().enumerate().skip(1) {
+                    if step == steps {
+                        continue;
+                    }
+                    let target = first + (last - first) * step as f64 / steps as f64;
+                    let delta = target - align_center(items[*item], axis_x);
+                    plan.push((
+                        items[*item].0,
+                        items[*item].1,
+                        if axis_x { delta } else { 0.0 },
+                        if axis_x { 0.0 } else { delta },
+                    ));
+                }
+            } else {
+                for (id, footprint, minx, miny, maxx, maxy) in &items {
+                    let (dx, dy) = match mode {
+                        "left" => (left - minx, 0.0),
+                        "right" => (right - maxx, 0.0),
+                        "center_x" => ((left + right) / 2.0 - (minx + maxx) / 2.0, 0.0),
+                        "top" => (0.0, top - miny),
+                        "bottom" => (0.0, bottom - maxy),
+                        _ => (0.0, (top + bottom) / 2.0 - (miny + maxy) / 2.0),
+                    };
+                    plan.push((*id, *footprint, dx, dy));
+                }
+            }
+            for (id, footprint, dx, dy) in plan {
+                if footprint {
+                    let f = p
+                        .board
+                        .footprints
+                        .iter_mut()
+                        .find(|f| f.id == id)
+                        .ok_or_else(missing)?;
+                    let position = Point::new(f.position.x + dx, f.position.y + dy);
+                    if !position.valid() {
+                        return Err(Error::Invalid("aligned position is out of range".into()));
+                    }
+                    f.position = position;
+                } else {
+                    let c = p
+                        .components
+                        .iter_mut()
+                        .find(|c| c.id == id)
+                        .ok_or_else(missing)?;
+                    let position = Point::new(c.position.x + dx, c.position.y + dy);
+                    if !position.valid() {
+                        return Err(Error::Invalid("aligned position is out of range".into()));
+                    }
+                    c.position = position;
+                    for unit in &mut c.units {
+                        let position = Point::new(unit.position.x + dx, unit.position.y + dy);
+                        if !position.valid() {
+                            return Err(Error::Invalid("aligned position is out of range".into()));
+                        }
+                        unit.position = position;
+                    }
+                }
+            }
+            Ok(json!({"aligned": seen.len(), "mode": mode}))
+        }
         "object.delete" => {
             let a: Object = parse(params)?;
             if !p.ids().any(|id| id == a.id) {
@@ -951,10 +1578,18 @@ fn run(p: &mut Project, next: &mut Id, command: &str, params: &Value) -> Result<
             p.nets.retain(|n| n.id != a.id);
             p.wires
                 .retain(|w| w.id != a.id && w.from.component != a.id && w.to.component != a.id);
+            p.drawn_wires
+                .retain(|w| w.id != a.id && w.net.is_none_or(|n| n != a.id));
+            p.graphics.retain(|g| g.id != a.id);
+            p.labels.retain(|l| l.id != a.id && l.net != a.id);
+            p.no_connects
+                .retain(|f| f.id != a.id && f.pin.component != a.id);
             p.board
                 .footprints
                 .retain(|f| f.id != a.id && f.component != a.id);
-            p.board.tracks.retain(|t| t.id != a.id);
+            p.board.tracks.retain(|t| t.id != a.id && t.net != a.id);
+            p.board.vias.retain(|v| v.id != a.id && v.net != a.id);
+            p.board.zones.retain(|z| z.id != a.id && z.net != a.id);
             p.board.cutouts.retain(|c| c.id != a.id);
             Ok(json!({"deleted":a.id}))
         }
@@ -971,6 +1606,477 @@ mod tests {
             .join(name)
             .to_string_lossy()
             .into_owned()
+    }
+    #[test]
+    fn drawn_wires_keep_vertices_bind_nets_and_undo_cleanly() -> Result<(), Error> {
+        let mut s = Session::default();
+        let net = s.execute("net.create", json!({"name":"N$1"}), None)?["result"]["id"]
+            .as_u64()
+            .ok_or_else(missing)?;
+        s.execute(
+            "wire.draw",
+            json!({"points":[{"x":10.0,"y":10.0},{"x":20.0,"y":10.0},{"x":20.0,"y":20.0}],"net":net}),
+            None,
+        )?;
+        assert_eq!(s.project.drawn_wires.len(), 1);
+        assert_eq!(s.project.drawn_wires[0].points.len(), 3);
+        assert_eq!(s.project.drawn_wires[0].net, Some(net));
+        assert!(s.project.validate().is_ok());
+        // A wire may be drawn before its net exists, and stays unconnected.
+        s.execute(
+            "wire.draw",
+            json!({"points":[{"x":0.0,"y":0.0},{"x":5.0,"y":0.0}]}),
+            None,
+        )?;
+        assert_eq!(s.project.drawn_wires[1].net, None);
+        // Repeated vertices and unknown nets are rejected without touching state.
+        assert!(
+            s.execute(
+                "wire.draw",
+                json!({"points":[{"x":1.0,"y":1.0},{"x":1.0,"y":1.0}]}),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            s.execute(
+                "wire.draw",
+                json!({"points":[{"x":1.0,"y":1.0},{"x":2.0,"y":1.0}],"net":9999}),
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(s.project.drawn_wires.len(), 2);
+        let drawn = s.project.drawn_wires[0].id;
+        s.execute("object.delete", json!({"id":drawn}), None)?;
+        assert_eq!(s.project.drawn_wires.len(), 1);
+        s.undo()?;
+        assert_eq!(s.project.drawn_wires.len(), 2);
+        Ok(())
+    }
+    #[test]
+    fn graphic_add_validates_each_shape_and_deletes_and_undoes_cleanly() -> Result<(), Error> {
+        let mut s = Session::default();
+        for params in [
+            json!({"layer":"schematic","shape":"line","points":[{"x":1.0,"y":1.0},{"x":10.0,"y":1.0}],"width":0.2}),
+            json!({"layer":"schematic","shape":"rect","points":[{"x":0.0,"y":0.0},{"x":5.0,"y":3.0}],"width":0.2}),
+            json!({"layer":"board","shape":"circle","points":[{"x":10.0,"y":10.0}],"width":2.0}),
+            json!({"layer":"board","shape":"arc","points":[{"x":0.0,"y":0.0},{"x":5.0,"y":7.0},{"x":10.0,"y":0.0}],"width":0.2}),
+            json!({"layer":"board","shape":"polygon","points":[{"x":0.0,"y":0.0},{"x":4.0,"y":0.0},{"x":2.0,"y":3.0}],"width":0.1}),
+            json!({"layer":"schematic","shape":"text","points":[{"x":2.0,"y":2.0}],"width":1.5,"text":"REV B"}),
+        ] {
+            s.execute("graphic.add", params, None)?;
+        }
+        assert_eq!(s.project.graphics.len(), 6);
+        assert!(s.project.validate().is_ok());
+        assert_eq!(
+            s.project
+                .graphics
+                .iter()
+                .filter(|g| g.shape == "circle")
+                .flat_map(|g| g.outline().unwrap_or_default())
+                .count(),
+            25
+        );
+        // Unknown shapes, wrong vertex counts and misuse of text are rejected
+        // without touching state.
+        for params in [
+            json!({"layer":"schematic","shape":"spline","points":[{"x":1.0,"y":1.0}],"width":0.2}),
+            json!({"layer":"schematic","shape":"line","points":[{"x":1.0,"y":1.0}],"width":0.2}),
+            json!({"layer":"schematic","shape":"text","points":[{"x":1.0,"y":1.0}],"width":1.0}),
+            json!({"layer":"schematic","shape":"line","points":[{"x":1.0,"y":1.0},{"x":2.0,"y":1.0}],"width":0.2,"text":"oops"}),
+            json!({"layer":"copper","shape":"line","points":[{"x":1.0,"y":1.0},{"x":2.0,"y":1.0}],"width":0.2}),
+            json!({"layer":"schematic","shape":"line","points":[{"x":1.0,"y":1.0},{"x":2.0,"y":1.0}],"width":0.0}),
+        ] {
+            assert!(s.execute("graphic.add", params, None).is_err());
+        }
+        assert_eq!(s.project.graphics.len(), 6);
+        let graphic = s.project.graphics[2].id;
+        s.execute("object.delete", json!({"id":graphic}), None)?;
+        assert_eq!(s.project.graphics.len(), 5);
+        s.undo()?;
+        assert_eq!(s.project.graphics.len(), 6);
+        Ok(())
+    }
+    #[test]
+    fn labels_and_no_connect_flags_validate_bind_and_undo_cleanly() -> Result<(), Error> {
+        let mut s = Session::default();
+        let net = s.execute("net.create", json!({"name":"VCC"}), None)?["result"]["id"]
+            .as_u64()
+            .ok_or_else(missing)?;
+        for kind in ["label", "global", "hierarchical", "power"] {
+            s.execute(
+                "label.place",
+                json!({"kind":kind,"net":net,"position":{"x":10.0,"y":5.0},"rotation":90.0}),
+                None,
+            )?;
+        }
+        assert_eq!(s.project.labels.len(), 4);
+        assert!(s.project.validate().is_ok());
+        // A junction needs a drawn wire of its net under one of its vertices.
+        assert!(
+            s.execute(
+                "label.place",
+                json!({"kind":"junction","net":net,"position":{"x":10.0,"y":5.0}}),
+                None
+            )
+            .is_err()
+        );
+        s.execute(
+            "wire.draw",
+            json!({"points":[{"x":10.0,"y":5.0},{"x":20.0,"y":5.0}],"net":net}),
+            None,
+        )?;
+        s.execute(
+            "label.place",
+            json!({"kind":"junction","net":net,"position":{"x":10.0,"y":5.0}}),
+            None,
+        )?;
+        assert_eq!(s.project.labels.len(), 5);
+        // Unknown kinds, unknown nets and off-wire junctions change nothing.
+        for params in [
+            json!({"kind":"port","net":net,"position":{"x":1.0,"y":1.0}}),
+            json!({"kind":"label","net":9999,"position":{"x":1.0,"y":1.0}}),
+            json!({"kind":"junction","net":net,"position":{"x":15.0,"y":9.0}}),
+        ] {
+            assert!(s.execute("label.place", params, None).is_err());
+        }
+        assert_eq!(s.project.labels.len(), 5);
+        // No-connect flags need a real, unconnected pin.
+        s.execute(
+            "component.add",
+            json!({"kind":"resistor","reference":"R9","value":"1 k","position":{"x":50.0,"y":30.0}}),
+            None,
+        )?;
+        let resistor = s
+            .project
+            .components
+            .last()
+            .ok_or_else(|| "missing resistor".to_string())?
+            .id;
+        let other = s.project.components[0].id;
+        s.execute(
+            "pin.no_connect",
+            json!({"pin":{"component":resistor,"pin":"1"}}),
+            None,
+        )?;
+        assert_eq!(s.project.no_connects.len(), 1);
+        for params in [
+            json!({"pin":{"component":9999,"pin":"1"}}),
+            json!({"pin":{"component":resistor,"pin":"7"}}),
+            json!({"pin":{"component":other,"pin":"1"}}),
+            json!({"pin":{"component":resistor,"pin":"1"}}),
+        ] {
+            assert!(s.execute("pin.no_connect", params, None).is_err());
+        }
+        assert_eq!(s.project.no_connects.len(), 1);
+        // Deleting the net removes the labels that named it.
+        s.execute("object.delete", json!({"id":net}), None)?;
+        assert!(s.project.labels.is_empty());
+        s.undo()?;
+        assert_eq!(s.project.labels.len(), 5);
+        assert_eq!(s.project.no_connects.len(), 1);
+        Ok(())
+    }
+    #[test]
+    fn via_place_validates_binds_to_nets_and_undoes_cleanly() -> Result<(), Error> {
+        let mut s = Session::default();
+        let net = s.execute("net.create", json!({"name":"GND"}), None)?["result"]["id"]
+            .as_u64()
+            .ok_or_else(missing)?;
+        s.execute(
+            "via.place",
+            json!({"net":net,"position":{"x":10.0,"y":10.0},"diameter":1.4,"drill":0.4}),
+            None,
+        )?;
+        s.execute(
+            "via.place",
+            json!({"net":net,"position":{"x":12.0,"y":10.0},"diameter":1.0}),
+            None,
+        )?;
+        assert_eq!(s.project.board.vias.len(), 2);
+        assert!(s.project.validate().is_ok());
+        for params in [
+            json!({"net":9999,"position":{"x":10.0,"y":10.0},"diameter":1.4}),
+            json!({"net":net,"position":{"x":10.0,"y":10.0},"diameter":0.0}),
+            json!({"net":net,"position":{"x":10.0,"y":10.0},"diameter":1.4,"drill":1.4}),
+            json!({"net":net,"position":{"x":10.0,"y":10.0},"diameter":1.4,"drill":-0.1}),
+            json!({"net":net,"position":{"x":10.0,"y":10.0},"diameter":101.0}),
+        ] {
+            assert!(s.execute("via.place", params, None).is_err());
+        }
+        assert_eq!(s.project.board.vias.len(), 2);
+        let via = s.project.board.vias[0].id;
+        s.execute("object.delete", json!({"id":via}), None)?;
+        assert_eq!(s.project.board.vias.len(), 1);
+        // Deleting the net removes the vias that carry it.
+        s.execute("object.delete", json!({"id":net}), None)?;
+        assert!(s.project.board.vias.is_empty());
+        s.undo()?;
+        assert_eq!(s.project.board.vias.len(), 1);
+        Ok(())
+    }
+    #[test]
+    fn via_stitch_places_grids_and_validates_without_mutating() -> Result<(), Error> {
+        let mut s = Session::default();
+        let net = s.execute("net.create", json!({"name":"GND"}), None)?["result"]["id"]
+            .as_u64()
+            .ok_or_else(missing)?;
+        let out = s.execute(
+            "via.stitch",
+            json!({"net":net,"bounds":{"x":5.0,"y":5.0,"width":10.0,"height":10.0},"spacing":5.0,"diameter":1.4,"drill":0.4}),
+            None,
+        )?;
+        assert_eq!(out["result"]["count"], 9);
+        assert_eq!(s.project.board.vias.len(), 9);
+        assert_eq!(s.project.board.vias[0].position, Point::new(7.5, 7.5));
+        assert_eq!(s.project.board.vias[8].position, Point::new(17.5, 17.5));
+        assert!(s.project.validate().is_ok());
+        for params in [
+            json!({"net":9999,"bounds":{"x":5.0,"y":5.0,"width":10.0,"height":10.0},"diameter":1.4}),
+            json!({"net":net,"bounds":{"x":5.0,"y":5.0,"width":10.0,"height":10.0},"diameter":1.4,"spacing":0.4}),
+            json!({"net":net,"bounds":{"x":5.0,"y":5.0,"width":10.0,"height":10.0},"diameter":1.4,"spacing":51.0}),
+            json!({"net":net,"bounds":{"x":50.0,"y":5.0,"width":20.0,"height":10.0},"diameter":1.4}),
+            json!({"net":net,"bounds":{"x":0.0,"y":0.0,"width":100.0,"height":100.0},"diameter":1.4,"spacing":0.5}),
+            json!({"net":net,"bounds":{"x":5.0,"y":5.0,"width":10.0,"height":10.0},"diameter":1.4,"drill":1.4}),
+        ] {
+            assert!(s.execute("via.stitch", params, None).is_err());
+        }
+        assert_eq!(s.project.board.vias.len(), 9);
+        s.undo()?;
+        assert!(s.project.board.vias.is_empty());
+        Ok(())
+    }
+    #[test]
+    fn align_and_distribute_move_groups_and_undo_cleanly() -> Result<(), Error> {
+        let mut s = Session::default();
+        let mut ids = vec![];
+        for (x, y) in [(10.0, 10.0), (20.0, 14.0), (35.0, 8.0)] {
+            let out = s.execute(
+                "component.add",
+                json!({"kind":"resistor","position":{"x":x,"y":y}}),
+                None,
+            )?;
+            ids.push(out["result"]["id"].as_u64().ok_or_else(missing)?);
+        }
+        s.execute("align.distribute", json!({"ids":ids,"mode":"left"}), None)?;
+        for c in &s.project.components {
+            assert_eq!(c.position.x, 10.0, "left edge alignment");
+        }
+        s.undo()?;
+        assert_eq!(s.project.components[1].position.x, 20.0);
+        s.execute("align.distribute", json!({"ids":ids,"mode":"top"}), None)?;
+        for c in &s.project.components {
+            assert_eq!(c.position.y, 8.0, "top edge alignment");
+        }
+        s.execute(
+            "align.distribute",
+            json!({"ids":ids,"mode":"distribute_x"}),
+            None,
+        )?;
+        let xs: Vec<f64> = s.project.components.iter().map(|c| c.position.x).collect();
+        assert_eq!(
+            xs,
+            vec![10.0, 22.5, 35.0],
+            "even distribution between the ends"
+        );
+        let sync = s.execute("board.sync", json!({}), None)?;
+        let fp_ids: Vec<u64> = sync["result"]["footprints"]
+            .as_array()
+            .ok_or_else(missing)?
+            .iter()
+            .map(|f| f["id"].as_u64().unwrap_or_default())
+            .collect();
+        s.execute(
+            "footprint.move",
+            json!({"id":fp_ids[2],"position":{"x":30.0,"y":25.0}}),
+            None,
+        )?;
+        s.execute("align.distribute", json!({"ids":fp_ids,"mode":"top"}), None)?;
+        for f in &s.project.board.footprints {
+            assert_eq!(f.position.y, 10.0, "footprint top alignment");
+        }
+        for params in [
+            json!({"ids":[ids[0],9999],"mode":"left"}),
+            json!({"ids":ids,"mode":"sideways"}),
+            json!({"ids":[ids[0]],"mode":"left"}),
+            json!({"ids":ids,"mode":"left","extra":1}),
+        ] {
+            assert!(s.execute("align.distribute", params, None).is_err());
+        }
+        let xs: Vec<f64> = s.project.components.iter().map(|c| c.position.x).collect();
+        assert_eq!(
+            xs,
+            vec![10.0, 22.5, 35.0],
+            "rejections must not move anything"
+        );
+        let ys: Vec<f64> = s
+            .project
+            .board
+            .footprints
+            .iter()
+            .map(|f| f.position.y)
+            .collect();
+        assert_eq!(ys, vec![10.0, 10.0, 10.0]);
+        Ok(())
+    }
+    #[test]
+    fn splitting_tracks_and_wires_preserves_geometry_and_rejects_bad_points() -> Result<(), Error> {
+        let mut s = Session::default();
+        let net = s.execute("net.create", json!({"name":"SIG"}), None)?["result"]["id"]
+            .as_u64()
+            .ok_or_else(missing)?;
+        let wire = s.execute(
+            "wire.draw",
+            json!({"points":[{"x":10.0,"y":10.0},{"x":20.0,"y":10.0},{"x":20.0,"y":20.0}],"net":net}),
+            None,
+        )?["result"]["id"]
+            .as_u64()
+            .ok_or_else(missing)?;
+        let tail = s.execute(
+            "wire.split",
+            json!({"id":wire,"at":{"x":15.0,"y":10.0}}),
+            None,
+        )?["result"]["id"]
+            .as_u64()
+            .ok_or_else(missing)?;
+        assert_eq!(s.project.drawn_wires[0].points.len(), 2);
+        assert_eq!(s.project.drawn_wires[1].points.len(), 3);
+        assert_eq!(s.project.drawn_wires[1].points[0], Point::new(15.0, 10.0));
+        assert_eq!(s.project.drawn_wires[0].net, Some(net));
+        assert_eq!(s.project.drawn_wires[1].net, Some(net));
+        assert_eq!(s.project.drawn_wires[1].id, tail);
+        assert!(s.project.validate().is_ok());
+        let track = s.execute(
+            "track.add",
+            json!({"net":net,"start":{"x":30.0,"y":30.0},"end":{"x":40.0,"y":30.0},"width":0.25,"layer":"B.Cu"}),
+            None,
+        )?["result"]["id"]
+            .as_u64()
+            .ok_or_else(missing)?;
+        let second = s.execute(
+            "track.split",
+            json!({"id":track,"at":{"x":35.0,"y":30.0}}),
+            None,
+        )?["result"]["id"]
+            .as_u64()
+            .ok_or_else(missing)?;
+        assert_eq!(s.project.board.tracks[0].end, Point::new(35.0, 30.0));
+        assert_eq!(s.project.board.tracks[1].start, Point::new(35.0, 30.0));
+        assert_eq!(s.project.board.tracks[1].end, Point::new(40.0, 30.0));
+        assert_eq!(s.project.board.tracks[1].layer, pcbcraft_doc::Layer::Back);
+        assert_eq!(s.project.board.tracks[1].net, net);
+        assert!(s.project.validate().is_ok());
+        for params in [
+            json!({"id":wire,"at":{"x":15.0,"y":12.0}}),
+            json!({"id":wire,"at":{"x":20.0,"y":10.0}}),
+            json!({"id":9999,"at":{"x":15.0,"y":10.0}}),
+            json!({"id":track,"at":{"x":35.0,"y":31.0}}),
+            json!({"id":track,"at":{"x":30.005,"y":30.0}}),
+            json!({"id":track,"at":{"x":1e6,"y":30.0}}),
+        ] {
+            let command =
+                if params["id"].as_u64() == Some(track) || params["id"].as_u64() == Some(9999) {
+                    "track.split"
+                } else {
+                    "wire.split"
+                };
+            assert!(s.execute(command, params, None).is_err());
+        }
+        assert_eq!(s.project.board.tracks.len(), 2);
+        assert_eq!(s.project.drawn_wires.len(), 2);
+        assert_eq!(s.project.board.tracks[1].id, second);
+        s.undo()?;
+        assert_eq!(s.project.board.tracks.len(), 1);
+        assert_eq!(s.project.board.tracks[0].end, Point::new(40.0, 30.0));
+        assert_eq!(s.project.drawn_wires[0].points.len(), 2);
+        s.undo()?;
+        assert!(s.project.board.tracks.is_empty());
+        assert_eq!(s.project.drawn_wires.len(), 2);
+        s.undo()?;
+        assert_eq!(s.project.drawn_wires.len(), 1);
+        assert_eq!(s.project.drawn_wires[0].points.len(), 3);
+        Ok(())
+    }
+    #[test]
+    fn zone_place_validates_and_undoes_cleanly() -> Result<(), Error> {
+        let mut s = Session::default();
+        let net = s.execute("net.create", json!({"name":"GND"}), None)?["result"]["id"]
+            .as_u64()
+            .ok_or_else(missing)?;
+        let square = json!([
+            {"x":5.0,"y":5.0},
+            {"x":55.0,"y":5.0},
+            {"x":55.0,"y":35.0},
+            {"x":5.0,"y":35.0},
+            {"x":5.0,"y":5.0}
+        ]);
+        s.execute(
+            "zone.place",
+            json!({"net":net,"layer":"F.Cu","outline":square}),
+            None,
+        )?;
+        s.execute("zone.place", json!({"net":net,"outline":square}), None)?;
+        assert_eq!(s.project.board.zones.len(), 2);
+        assert_eq!(s.project.board.zones[0].layer, pcbcraft_doc::Layer::Front);
+        assert!(s.project.validate().is_ok());
+        for params in [
+            json!({"net":9999,"outline":square}),
+            json!({"net":net,"outline":[{"x":0.0,"y":0.0},{"x":10.0,"y":0.0},{"x":0.0,"y":0.0}]}),
+            json!({"net":net,"outline":[{"x":0.0,"y":0.0},{"x":10.0,"y":0.0},{"x":10.0,"y":5.0},{"x":1.0,"y":5.0}]}),
+            json!({"net":net,"outline":[{"x":0.0,"y":0.0},{"x":10.0,"y":0.0},{"x":10.0,"y":5.0},{"x":0.0,"y":5.0}]}),
+            json!({"net":net,"outline":[{"x":0.0,"y":0.0},{"x":0.0,"y":0.0},{"x":0.0,"y":0.0},{"x":0.0,"y":0.0}]}),
+            json!({"net":net,"outline":[{"x":100001.0,"y":0.0},{"x":10.0,"y":0.0},{"x":10.0,"y":5.0},{"x":0.0,"y":5.0},{"x":0.0,"y":0.0}]}),
+        ] {
+            assert!(s.execute("zone.place", params, None).is_err());
+        }
+        assert_eq!(s.project.board.zones.len(), 2);
+        let zone = s.project.board.zones[0].id;
+        s.execute("object.delete", json!({"id":zone}), None)?;
+        assert_eq!(s.project.board.zones.len(), 1);
+        s.execute("object.delete", json!({"id":net}), None)?;
+        assert!(s.project.board.zones.is_empty());
+        s.undo()?;
+        assert_eq!(s.project.board.zones.len(), 1);
+        Ok(())
+    }
+    #[test]
+    fn zone_cutout_validates_and_undoes_cleanly() -> Result<(), Error> {
+        let mut s = Session::default();
+        let net = s.execute("net.create", json!({"name":"GND"}), None)?["result"]["id"]
+            .as_u64()
+            .ok_or_else(missing)?;
+        let square = json!([
+            {"x":5.0,"y":5.0},
+            {"x":55.0,"y":5.0},
+            {"x":55.0,"y":35.0},
+            {"x":5.0,"y":35.0},
+            {"x":5.0,"y":5.0}
+        ]);
+        s.execute("zone.place", json!({"net":net,"outline":square}), None)?;
+        let zone = s.project.board.zones[0].id;
+        let cut = json!([
+            {"x":20.0,"y":15.0},
+            {"x":30.0,"y":15.0},
+            {"x":30.0,"y":25.0},
+            {"x":20.0,"y":25.0},
+            {"x":20.0,"y":15.0}
+        ]);
+        let out = s.execute("zone.cutout", json!({"zone":zone,"outline":cut}), None)?;
+        assert_eq!(out["result"]["cutouts"], 1);
+        assert!(s.project.validate().is_ok());
+        for params in [
+            json!({"zone":9999,"outline":cut}),
+            json!({"zone":zone,"outline":[{"x":0.0,"y":0.0},{"x":10.0,"y":0.0},{"x":10.0,"y":5.0}]}),
+            json!({"zone":zone,"outline":[{"x":0.0,"y":0.0},{"x":10.0,"y":0.0},{"x":10.0,"y":5.0},{"x":1.0,"y":5.0}]}),
+            json!({"zone":zone,"outline":[{"x":0.0,"y":0.0},{"x":0.0,"y":0.0},{"x":0.0,"y":0.0},{"x":0.0,"y":0.0}]}),
+        ] {
+            assert!(s.execute("zone.cutout", params, None).is_err());
+        }
+        assert_eq!(s.project.board.zones[0].cutouts.len(), 1);
+        s.undo()?;
+        assert!(s.project.board.zones[0].cutouts.is_empty());
+        Ok(())
     }
     #[test]
     fn imported_definitions_survive_roundtrip_and_assignment_is_undoable() -> Result<(), Error> {
