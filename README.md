@@ -16,27 +16,90 @@ board export. The complete EDA roadmap is in [ROADMAP.md](ROADMAP.md).
 - Dark default, light theme, persistent accent and grid preferences, zoom around
   the cursor, middle-button pan, symbol previews and drag-to-move.
 - Periodic project recovery and recovery on normal close, using application storage.
+- One-command alignment and distribution for groups of schematic symbols or
+  board footprints: flush left/right/top/bottom, shared horizontal or vertical
+  centre, even spacing along an axis, or snapping placements to the nearest
+  multiple of a grid. Mirror a placed symbol or footprint left-to-right or
+  top-to-bottom about its own origin; pins, pads, embedded library graphics
+  and per-unit placements all flip together and two mirrors cancel exactly.
+- Split an existing copper segment or drawn wire at any point on it; both
+  halves keep the net, width and layer of the original. Cut the corner
+  between two joined same-net track segments with a diagonal chamfer.
+  Duplicate components
+  at an offset with fresh ids and automatically unique reference labels,
+  bringing the physical footprint when one is assigned. Placed copper
+  segments and vias move after the fact, and the clearance findings follow
+  the move. Reference designators and net names can be renamed at any time,
+  validated unique against the rest of the design, and a netlist table can be
+  imported in one step to assign pins to named nets by reference, or read back
+  as a net-by-net pin table that also lists every unconnected pin. Components
+  carry named properties (datasheet, manufacturer, custom notes) that are set,
+  replaced or cleared one at a time and travel with a duplicate, and a bill of
+  materials groups the design by value, kind and footprint with any requested
+  properties as extra grouping columns. Routed copper length is reported per
+  net, with via counts and a list of nets that have no copper at all; a net
+  class can demand a target routed length within a tolerance, and member nets
+  outside that window are reported by the checks. Any
+  check code can be re-levelled between error and warning, or silenced
+  entirely, when its findings are normal for a particular design; individual
+  objects can also be excluded per code, so one accepted clearance silences
+  just that finding instead of the whole check. Net classes
+  can also demand a minimum and maximum track width, and member tracks
+  outside those bounds are reported by the checks. Components can be found by
+  reference wildcard, exact value or kind, with each hit reporting whether it
+  is placed on the board, and align or distribute can select its group with
+  that same filter instead of an id list.
 - Original resistor, capacitor, LED and two-pin connector symbols; explicit
-  logical nets and pin-to-pin orthogonal wire presentations.
+  logical nets, pin-to-pin orthogonal wire presentations and free-form drawn
+  wires with explicit vertices that may be bound to a net and edited after
+  the fact (insert or remove any vertex), and free-standing
+  schematic/board graphics (lines, rectangles, circles, arcs, polygons and text);
+  local/global/hierarchical/power labels, junctions and no-connect flags that
+  suppress the matching ERC warning, all movable after placement (graphics by
+  delta, labels to an absolute position, junctions only onto a vertex of
+  their net) and rotatable (graphics in 90-degree steps about their centre or
+  a chosen pivot, labels by any angle); plated through-hole vias that join front
+  and back copper, including stitch grids that fill a rectangular area with a
+  via lattice; poured copper zones as closed polygons on either layer, with
+  cutouts that remove copper from a zone; a moved zone shifts its outline and
+  every cutout together.
+- Connectivity stays editable: pins can be taken back out of a net, which clears
+  the matching placed pads too, and a placed track, via or copper zone can be
+  switched to another net without deleting and redrawing it.
 - Background search and geometry previews of installed KiCad symbol/footprint
   libraries, including inherited definitions. Place supported symbols with
   independently movable schematic units within one physical package, assign
-  matching front SMD or plated through-hole footprints, and embed used definitions.
+  matching front SMD or plated through-hole footprints, in bulk with a
+  reference wildcard, and embed used definitions.
 - Symbol and footprint editors in the Libraries tab: editable pins, unit membership,
   pad/drill dimensions, and line/rectangle/circle/arc/polyline/text graphics. Save
   undoable project-library definitions and reusable `.pcbcraft-lib` collections.
 - Schematic-to-PCB sync retains existing placements and reconciles pad nets.
+  A pad table report lists every board pad by component reference with its net,
+  position, shape, size and drill, for the whole board or one component.
 - Real circle/rectangle/roundrect/oval front SMD and plated through-hole pads,
   circular/oval offset drills, plus generic starter pads;
   straight or two-segment orthogonal tracks;
   airwires from actual same-layer copper connectivity.
+- Copper sizes stay editable after placement: change a track's width or a via's
+  pad and drill, and the clearance and width-bound findings follow immediately.
 - Editable rectangular board width/height and dimensioned circular cutouts,
-  exported as Edge.Cuts. Constrained/parametric outline sketches are planned.
+  exported as Edge.Cuts. Cutouts can be nudged and resized afterwards as long as
+  they stay inside the outline, and the copper-to-cutout checks follow.
+  Constrained/parametric outline sketches are planned.
+- Free text labels on either copper side with a glyph height in millimetres,
+  for assembly notes and markings; move, re-edit, and delete them like any
+  other object, and they appear in previews and saved projects.
 - Initial pin assignment/net-population checks and copper short, clearance,
   board-edge, cutout and unrouted checks with affected object IDs.
-- 26 engine commands, discoverable schemas, atomic batches, stable IDs,
+- Named net classes: group nets once and every clearance check between their
+  copper uses the strictest requirement involved, while new tracks and routes
+  on a classified net start at that class's width unless a width is given. A
+  class can be retuned later or deleted outright, which returns its nets to the
+  board default rules.
+- 80 engine commands, discoverable schemas, atomic batches, stable IDs,
   revision guards, 32-step undo/redo and validated atomic project saves.
-- 44 MCP tools: every engine command plus library discovery/search/inspection,
+- 98 MCP tools: every engine command plus library discovery/search/inspection,
   design inspection, checks, persistence,
   export and PNG previews. Headless or bridged into the actual running desktop.
 - Rust browser entry point; the shared UI and engine compile to WebAssembly.
