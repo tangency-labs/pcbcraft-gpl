@@ -3,6 +3,21 @@ use egui::{Pos2, Sense};
 use pcbcraft_doc::{Component, Layer};
 use pcbcraft_geom::point_segment;
 
+/// Net spotlight: copper on the spotlighted net takes the accent colour and
+/// everything else fades, so one click can trace a net across the board.
+fn spotlight(lit: Option<Id>, net: Option<Id>, base: Color32, hot: Color32) -> Color32 {
+    match lit {
+        None => base,
+        Some(hot_net) => {
+            if net == Some(hot_net) {
+                hot
+            } else {
+                base.gamma_multiply(0.25)
+            }
+        }
+    }
+}
+
 fn snap(p: Point) -> Point {
     Point::new((p.x * 2.0).round() / 2.0, (p.y * 2.0).round() / 2.0)
 }
@@ -82,6 +97,26 @@ fn fill_polygon(painter: &egui::Painter, points: &[Pos2], color: Color32, clip: 
         }
     }
 }
+/// Ray-cast point-in-polygon test for closed outlines (first vertex repeated).
+fn polygon_contains(points: &[Point], pos: Point) -> bool {
+    let mut inside = false;
+    for edge in points.windows(2) {
+        let (a, b) = (edge[0], edge[1]);
+        if (a.y > pos.y) != (b.y > pos.y) && pos.x < (b.x - a.x) * (pos.y - a.y) / (b.y - a.y) + a.x
+        {
+            inside = !inside;
+        }
+    }
+    inside
+}
+impl App {
+    /// Copper colour for one net under the current spotlight: the lit net
+    /// glows in the accent colour, other copper fades away.
+    fn copper(&self, net: Option<Id>, base: Color32) -> Color32 {
+        spotlight(self.highlight_net, net, base, self.accent())
+    }
+}
+
 impl App {
     pub(super) fn select_at(&mut self, pos: Point, zoom: f32) {
         let id = self.pick_object(pos, zoom);
@@ -457,6 +492,15 @@ impl App {
             {
                 return Some(c.id);
             }
+            if let Some(z) = self
+                .project
+                .board
+                .zones
+                .iter()
+                .find(|z| polygon_contains(&z.outline, pos))
+            {
+                return Some(z.id);
+            }
             self.project
                 .board
                 .tracks
@@ -616,6 +660,77 @@ impl App {
                     p.net_name(w.net),
                     FontId::monospace(10.0),
                     self.accent(),
+                );
+            }
+        }
+        for w in &p.drawn_wires {
+            painter.add(egui::Shape::line(
+                w.points
+                    .iter()
+                    .map(|point| camera.screen(*point, rect))
+                    .collect(),
+                Stroke::new(1.8, self.accent()),
+            ));
+        }
+        for g in p.graphics.iter().filter(|g| g.layer == "schematic") {
+            if let Some(outline) = g.outline() {
+                painter.add(egui::Shape::line(
+                    outline
+                        .iter()
+                        .map(|point| camera.screen(*point, rect))
+                        .collect(),
+                    Stroke::new(1.6, self.accent()),
+                ));
+            } else if let Some(anchor) = g.points.first() {
+                painter.text(
+                    camera.screen(*anchor, rect),
+                    Align2::LEFT_TOP,
+                    &g.text,
+                    FontId::proportional(g.width as f32),
+                    self.accent(),
+                );
+            }
+        }
+        for l in &p.labels {
+            let at = camera.screen(l.position, rect);
+            if l.kind == "junction" {
+                painter.circle_filled(at, 3.0, self.accent());
+            } else {
+                let text = match l.kind.as_str() {
+                    "global" => format!("{{{}}}", p.net_name(l.net)),
+                    "hierarchical" => format!("/{}", p.net_name(l.net)),
+                    "bus" => l.text.clone(),
+                    _ => p.net_name(l.net).to_string(),
+                };
+                painter.text(
+                    at,
+                    Align2::CENTER_BOTTOM,
+                    text,
+                    FontId::monospace(11.0),
+                    self.accent(),
+                );
+            }
+        }
+        for port in &p.ports {
+            let at = camera.screen(port.position, rect);
+            painter.text(
+                at,
+                Align2::CENTER_CENTER,
+                format!("[{}]", port.name),
+                FontId::monospace(11.0),
+                self.accent(),
+            );
+        }
+        for f in &p.no_connects {
+            if let Some(anchor) = p.pin_position(&f.pin) {
+                let at = camera.screen(anchor, rect);
+                painter.line_segment(
+                    [at + egui::vec2(-4.0, -4.0), at + egui::vec2(4.0, 4.0)],
+                    Stroke::new(1.6, egui::Color32::from_rgb(245, 141, 121)),
+                );
+                painter.line_segment(
+                    [at + egui::vec2(-4.0, 4.0), at + egui::vec2(4.0, -4.0)],
+                    Stroke::new(1.6, egui::Color32::from_rgb(245, 141, 121)),
                 );
             }
         }
@@ -858,6 +973,47 @@ impl App {
                 }
             }
         }
+        for z in &p.board.zones {
+            let screen: Vec<egui::Pos2> = z
+                .outline
+                .iter()
+                .map(|pt| camera.screen(*pt, rect))
+                .collect();
+            let rgb = if z.layer == Layer::Front {
+                [245, 141, 121]
+            } else {
+                [116, 167, 236]
+            };
+            let fill = if self.selected == Some(z.id) {
+                self.accent().linear_multiply(0.35)
+            } else {
+                Color32::from_rgb(rgb[0], rgb[1], rgb[2]).linear_multiply(0.3)
+            };
+            if z.filled || self.selected == Some(z.id) {
+                painter.add(egui::Shape::convex_polygon(
+                    screen.clone(),
+                    fill,
+                    Stroke::NONE,
+                ));
+            }
+            painter.add(egui::Shape::closed_line(
+                screen.clone(),
+                Stroke::new(1.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2])),
+            ));
+            for cut in &z.cutouts {
+                let cut_screen: Vec<egui::Pos2> =
+                    cut.iter().map(|pt| camera.screen(*pt, rect)).collect();
+                painter.add(egui::Shape::convex_polygon(
+                    cut_screen.clone(),
+                    Color32::from_rgb(25, 58, 54),
+                    Stroke::NONE,
+                ));
+                painter.add(egui::Shape::closed_line(
+                    cut_screen,
+                    Stroke::new(1.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2])),
+                ));
+            }
+        }
         for t in &p.board.tracks {
             painter.line_segment(
                 [camera.screen(t.start, rect), camera.screen(t.end, rect)],
@@ -866,12 +1022,53 @@ impl App {
                     if self.selected == Some(t.id) {
                         self.accent()
                     } else if t.layer == Layer::Front {
-                        Color32::from_rgb(245, 141, 121)
+                        self.copper(Some(t.net), Color32::from_rgb(245, 141, 121))
                     } else {
-                        Color32::from_rgb(116, 167, 236)
+                        self.copper(Some(t.net), Color32::from_rgb(116, 167, 236))
                     },
                 ),
             );
+        }
+        for v in &p.board.vias {
+            let at = camera.screen(v.position, rect);
+            let radius = (v.diameter as f32 / 2.0 * camera.zoom).max(2.0);
+            painter.circle_filled(
+                at,
+                radius,
+                if self.selected == Some(v.id) {
+                    self.accent()
+                } else {
+                    self.copper(Some(v.net), Color32::from_rgb(245, 141, 121))
+                },
+            );
+            if v.drill > 0.0 {
+                painter.circle_filled(
+                    at,
+                    (v.drill as f32 / 2.0 * camera.zoom).max(1.0),
+                    Color32::from_rgb(19, 28, 41),
+                );
+            }
+        }
+        for t in &p.board.netties {
+            let half = t.diameter / 2.0;
+            let axis = pcbcraft_geom::Point::new(half, 0.0).rotate(t.rotation);
+            for sign in [1.0, -1.0] {
+                let centre = t
+                    .position
+                    .offset(pcbcraft_geom::Point::new(axis.x * sign, axis.y * sign));
+                painter.circle_stroke(
+                    camera.screen(centre, rect),
+                    (half as f32 * camera.zoom).max(2.0),
+                    Stroke::new(
+                        1.5,
+                        if self.selected == Some(t.id) {
+                            self.accent()
+                        } else {
+                            Color32::from_rgb(216, 180, 255)
+                        },
+                    ),
+                );
+            }
         }
         for f in &p.board.footprints {
             let points = f
@@ -935,7 +1132,7 @@ impl App {
                             .into_iter()
                             .map(|p| camera.screen(f.position.offset(p.rotate(-f.rotation)), rect))
                             .collect(),
-                        Color32::from_rgb(230, 194, 125),
+                        self.copper(pad.net, Color32::from_rgb(230, 194, 125)),
                         Stroke::NONE,
                     ));
                     let hole = pad.drill_outline_points();
@@ -979,6 +1176,21 @@ impl App {
                     color,
                 );
             }
+        }
+        for t in &p.board.texts {
+            let at = camera.screen(t.position, rect);
+            let color = if t.layer == pcbcraft_doc::Layer::Front {
+                self.ink()
+            } else {
+                self.ink().gamma_multiply(0.75)
+            };
+            painter.text(
+                at,
+                Align2::LEFT_BOTTOM,
+                &t.text,
+                FontId::proportional((t.size as f32 * camera.zoom).max(1.0)),
+                color,
+            );
         }
         painter.text(
             board.left_bottom() + Vec2::new(0.0, 18.0),
@@ -1063,6 +1275,38 @@ mod library_render_tests {
                 .shapes
                 .iter()
                 .any(|s| matches!(&s.shape,egui::Shape::Path(p) if p.fill==Color32::WHITE))
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_net_spotlight_lights_one_net_and_fades_the_rest() {
+        let copper = Color32::from_rgb(245, 141, 121);
+        let hot = Color32::from_rgb(255, 200, 0);
+        assert_eq!(
+            spotlight(None, Some(4), copper, hot),
+            copper,
+            "with no spotlight every net keeps its own colour"
+        );
+        assert_eq!(
+            spotlight(Some(4), Some(4), copper, hot),
+            hot,
+            "the lit net glows in the accent colour"
+        );
+        let faded = spotlight(Some(4), Some(9), copper, hot);
+        assert_ne!(faded, copper);
+        assert!(
+            faded.gamma_multiply(4.0) != copper,
+            "other copper is dimmed, not recoloured"
+        );
+        assert_eq!(
+            spotlight(Some(4), None, copper, hot),
+            copper.gamma_multiply(0.25),
+            "copper without a net fades while a net is lit"
         );
     }
 }
