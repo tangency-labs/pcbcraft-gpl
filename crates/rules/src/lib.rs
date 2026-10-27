@@ -126,6 +126,52 @@ fn copper(project: &Project) -> Vec<Copper> {
             hole: None,
         });
     }
+    for v in &project.board.vias {
+        let hole = (v.drill > 0.0).then(|| Hole {
+            start: v.position,
+            end: v.position,
+            radius: v.drill / 2.0,
+        });
+        let item = Copper {
+            id: v.id,
+            net: v.net,
+            start: v.position,
+            end: v.position,
+            radius: v.diameter / 2.0,
+            contact_radius: v.diameter / 2.0,
+            conservative: false,
+            outline: None,
+            outline_error: 0.0,
+            layer: Layer::Front,
+            pad: true,
+            bridge: Some((v.id, "via".into())),
+            hole,
+        };
+        let mut back = item.clone();
+        back.layer = Layer::Back;
+        result.push(back);
+        result.push(item);
+    }
+    for z in &project.board.zones {
+        let Some(&first) = z.outline.first() else {
+            continue;
+        };
+        result.push(Copper {
+            id: z.id,
+            net: z.net,
+            start: first,
+            end: first,
+            radius: 0.0,
+            contact_radius: 0.0,
+            conservative: false,
+            outline: Some(z.outline.clone()),
+            outline_error: 0.0,
+            layer: z.layer,
+            pad: false,
+            bridge: None,
+            hole: None,
+        });
+    }
     result
 }
 fn hole_contains(hole: &Hole, other: &Copper) -> bool {
@@ -141,11 +187,29 @@ fn hole_contains(hole: &Hole, other: &Copper) -> bool {
         .into_iter()
         .all(|point| point_segment(point, hole.start, hole.end) + radius < hole.radius - 1e-6)
 }
+fn overlapping(a: &Copper, b: &Copper) -> bool {
+    // A segment endpoint (or one whole outline) inside another outline means
+    // real overlap, which capsule distance alone cannot see.
+    match (&a.outline, &b.outline) {
+        (Some(a_points), Some(b_points)) => {
+            let hit = |points: &[Point], other: &[Point]| {
+                points.first().is_some_and(|p| inside(*p, other))
+            };
+            hit(a_points, b_points) || hit(b_points, a_points)
+        }
+        (Some(a_points), None) => inside(b.start, a_points) || inside(b.end, a_points),
+        (None, Some(b_points)) => inside(a.start, b_points) || inside(a.end, b_points),
+        (None, None) => false,
+    }
+}
 fn touching(a: &Copper, b: &Copper) -> bool {
     if a.net != b.net {
         return false;
     }
     if a.bridge.is_some() && a.bridge == b.bridge {
+        return true;
+    }
+    if a.layer == b.layer && overlapping(a, b) {
         return true;
     }
     a.layer == b.layer
@@ -286,7 +350,12 @@ pub fn erc(project: &Project) -> Vec<Finding> {
     let mut result = vec![];
     for c in &project.components {
         for p in &c.pins {
-            if p.net.is_none() {
+            if p.net.is_none()
+                && !project
+                    .no_connects
+                    .iter()
+                    .any(|f| f.pin.component == c.id && f.pin.pin == p.number)
+            {
                 result.push(Finding {
                     code: "unassigned_pin",
                     severity: "warning",
@@ -421,7 +490,9 @@ pub fn drc(project: &Project) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pcbcraft_doc::{Footprint, Net, Pad, Track, component_template};
+    use pcbcraft_doc::{
+        Footprint, Net, NoConnectFlag, Pad, PinRef, Track, Via, component_template,
+    };
     fn fixture() -> Project {
         let mut p = Project::default();
         p.nets.push(Net {
@@ -469,6 +540,173 @@ mod tests {
             bridge: None,
             hole: None,
         }
+    }
+    #[test]
+    fn erc_suppresses_unassigned_pin_warnings_for_no_connect_flags() -> Result<(), String> {
+        let mut p = Project::default();
+        p.nets.push(Net {
+            id: 1,
+            name: "signal".into(),
+        });
+        let mut c = component_template("resistor", 2, "R2".into(), Point::new(10.0, 10.0))
+            .ok_or("resistor template missing")?;
+        c.pins[0].net = Some(1);
+        p.components.push(c);
+        let (component, pin) = p
+            .components
+            .first()
+            .and_then(|c| c.pins.get(1).map(|pin| (c.id, pin.number.clone())))
+            .ok_or("template pins missing")?;
+        assert!(erc(&p).iter().any(|f| f.code == "unassigned_pin"));
+        p.no_connects.push(NoConnectFlag {
+            id: 9,
+            pin: PinRef { component, pin },
+        });
+        p.validate()?;
+        assert!(!erc(&p).iter().any(|f| f.code == "unassigned_pin"));
+        Ok(())
+    }
+    #[test]
+    fn vias_join_front_and_back_copper_of_their_net() -> Result<(), String> {
+        let mut p = Project::default();
+        p.nets.push(Net {
+            id: 1,
+            name: "signal".into(),
+        });
+        p.board.tracks.push(Track {
+            id: 2,
+            net: 1,
+            start: Point::new(10.0, 10.0),
+            end: Point::new(12.0, 10.0),
+            width: 0.25,
+            layer: Layer::Front,
+        });
+        p.board.tracks.push(Track {
+            id: 3,
+            net: 1,
+            start: Point::new(12.2, 10.0),
+            end: Point::new(14.0, 10.0),
+            width: 0.25,
+            layer: Layer::Back,
+        });
+        p.board.vias.push(Via {
+            id: 4,
+            net: 1,
+            position: Point::new(12.1, 10.0),
+            diameter: 1.4,
+            drill: 0.4,
+        });
+        p.validate()?;
+        let items = copper(&p);
+        let front = items
+            .iter()
+            .find(|c| c.id == 4 && c.layer == Layer::Front)
+            .ok_or("front via copper missing")?;
+        let back = items
+            .iter()
+            .find(|c| c.id == 4 && c.layer == Layer::Back)
+            .ok_or("back via copper missing")?;
+        assert!(
+            touching(front, back),
+            "a plated via conducts on both layers"
+        );
+        let front_track = items
+            .iter()
+            .find(|c| c.id == 2)
+            .ok_or("front track missing")?;
+        assert!(
+            touching(front, front_track),
+            "the via pad must touch front copper it overlaps"
+        );
+        let back_track = items
+            .iter()
+            .find(|c| c.id == 3)
+            .ok_or("back track missing")?;
+        assert!(
+            touching(back, back_track),
+            "the via pad must touch back copper it overlaps"
+        );
+        Ok(())
+    }
+    #[test]
+    fn zones_conduct_same_net_copper_inside_their_outline() -> Result<(), String> {
+        let mut p = Project::default();
+        p.nets.push(Net {
+            id: 1,
+            name: "GND".into(),
+        });
+        p.nets.push(Net {
+            id: 2,
+            name: "other".into(),
+        });
+        let square = vec![
+            Point::new(0.0, 0.0),
+            Point::new(50.0, 0.0),
+            Point::new(50.0, 30.0),
+            Point::new(0.0, 30.0),
+            Point::new(0.0, 0.0),
+        ];
+        p.board.zones.push(pcbcraft_doc::CopperZone {
+            id: 4,
+            net: 1,
+            layer: Layer::Front,
+            outline: square,
+        });
+        p.board.tracks.push(Track {
+            id: 5,
+            net: 1,
+            start: Point::new(10.0, 10.0),
+            end: Point::new(20.0, 10.0),
+            width: 0.25,
+            layer: Layer::Front,
+        });
+        p.board.tracks.push(Track {
+            id: 6,
+            net: 1,
+            start: Point::new(10.0, 10.0),
+            end: Point::new(20.0, 10.0),
+            width: 0.25,
+            layer: Layer::Back,
+        });
+        p.board.tracks.push(Track {
+            id: 7,
+            net: 2,
+            start: Point::new(30.0, 20.0),
+            end: Point::new(40.0, 20.0),
+            width: 0.25,
+            layer: Layer::Front,
+        });
+        p.validate()?;
+        let items = copper(&p);
+        let zone = items
+            .iter()
+            .find(|c| c.id == 4)
+            .ok_or("zone copper missing")?;
+        let inside = items
+            .iter()
+            .find(|c| c.id == 5)
+            .ok_or("front track missing")?;
+        let other_layer = items
+            .iter()
+            .find(|c| c.id == 6)
+            .ok_or("back track missing")?;
+        let other_net = items
+            .iter()
+            .find(|c| c.id == 7)
+            .ok_or("other-net track missing")?;
+        assert!(
+            touching(zone, inside),
+            "same-net same-layer copper inside the outline conducts"
+        );
+        assert!(
+            !touching(zone, other_layer),
+            "the zone is confined to its own layer"
+        );
+        assert!(
+            !touching(zone, other_net),
+            "the zone never conducts to another net"
+        );
+        Ok(())
     }
     #[test]
     fn plated_pad_bridges_front_and_back_but_identity_and_net_must_match() {
