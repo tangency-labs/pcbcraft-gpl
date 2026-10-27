@@ -54,6 +54,39 @@ pub fn save(project: &Project, path: &Path) -> Result<(), String> {
 fn quote(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into())
 }
+/// SVG fragment for one project graphic: its outline as a stroked polyline, or a
+/// text element for the text shape.
+fn project_graphic_svg(g: &pcbcraft_doc::Graphic) -> String {
+    if g.shape == "text" {
+        let anchor = g.points.first().copied().unwrap_or_default();
+        return format!(
+            "<text x=\"{}\" y=\"{}\" font-size=\"{}\">{}</text>",
+            anchor.x,
+            anchor.y,
+            g.width,
+            escape(&g.text)
+        );
+    }
+    let points = g
+        .outline()
+        .unwrap_or_else(|| g.points.clone())
+        .iter()
+        .map(|p| format!("{},{}", p.x, p.y))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "<polyline points=\"{points}\" fill=\"none\" stroke=\"#5ae0bc\" stroke-width=\"{}\"/>",
+        g.width.min(0.4)
+    )
+}
+/// Text drawn for a label, with per-kind punctuation.
+fn label_text(l: &pcbcraft_doc::Label, net_name: &str) -> String {
+    match l.kind.as_str() {
+        "global" => format!("{{{net_name}}}"),
+        "hierarchical" => format!("/{net_name}"),
+        _ => net_name.to_string(),
+    }
+}
 fn uuid(id: u64, kind: usize) -> String {
     format!("{kind:08x}-0000-4000-8000-{id:012x}")
 }
@@ -212,7 +245,36 @@ fn escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 fn preview_bounds(p: &Project, view: &str) -> (Point, Point) {
-    if view == "pcb" || p.components.is_empty() {
+    let extend = |min: &mut Point, max: &mut Point, point: Point| {
+        min.x = min.x.min(point.x);
+        min.y = min.y.min(point.y);
+        max.x = max.x.max(point.x);
+        max.y = max.y.max(point.y);
+    };
+    if view == "pcb" {
+        let mut min = Point::new(p.board.width, p.board.height);
+        let mut max = Point::default();
+        for g in p.graphics.iter().filter(|g| g.layer == "board") {
+            for point in g.points.iter().flat_map(|pt| {
+                g.outline()
+                    .unwrap_or_else(|| vec![*pt])
+                    .into_iter()
+                    .chain(std::iter::once(*pt))
+            }) {
+                extend(&mut min, &mut max, point);
+            }
+        }
+        for t in &p.board.texts {
+            if t.position.x.is_finite() && t.position.y.is_finite() {
+                extend(&mut min, &mut max, t.position);
+            }
+        }
+        if min.x.is_finite() && max.x.is_finite() {
+            return (
+                Point::new(min.x.min(0.0), min.y.min(0.0)),
+                Point::new(max.x.max(p.board.width), max.y.max(p.board.height)),
+            );
+        }
         return (Point::default(), Point::new(p.board.width, p.board.height));
     }
     let mut min = Point::new(f64::INFINITY, f64::INFINITY);
@@ -220,10 +282,22 @@ fn preview_bounds(p: &Project, view: &str) -> (Point, Point) {
     for c in p.components.iter().flat_map(|c| c.schematic_views()) {
         for point in c.drawing_points() {
             let point = c.position.offset(point.rotate(-c.rotation));
-            min.x = min.x.min(point.x);
-            min.y = min.y.min(point.y);
-            max.x = max.x.max(point.x);
-            max.y = max.y.max(point.y);
+            extend(&mut min, &mut max, point);
+        }
+    }
+    for w in &p.drawn_wires {
+        for point in &w.points {
+            extend(&mut min, &mut max, *point);
+        }
+    }
+    for g in p.graphics.iter().filter(|g| g.layer == "schematic") {
+        for point in &g.points {
+            extend(&mut min, &mut max, *point);
+        }
+        if let Some(outline) = g.outline() {
+            for point in outline {
+                extend(&mut min, &mut max, point);
+            }
         }
     }
     if !min.x.is_finite() || !min.y.is_finite() || !max.x.is_finite() || !max.y.is_finite() {
@@ -251,8 +325,71 @@ pub fn svg(p: &Project, view: &str) -> Result<String, String> {
         for c in &p.board.cutouts {
             s.push_str(&format!("<circle cx=\"{}\" cy=\"{}\" r=\"{}\" fill=\"#131c29\" stroke=\"#5ae0bc\" stroke-width=\"0.1\"/>",c.center.x,c.center.y,c.radius));
         }
+        for z in &p.board.zones {
+            let color = if z.layer == pcbcraft_doc::Layer::Front {
+                "#f58d79"
+            } else {
+                "#74a7ec"
+            };
+            let points: Vec<String> = z
+                .outline
+                .iter()
+                .map(|pt| format!("{} {}", pt.x, pt.y))
+                .collect();
+            s.push_str(&format!(
+                "<polygon points=\"{}\" fill=\"{color}\" fill-opacity=\"{}\" stroke=\"{color}\" stroke-width=\"0.1\"{} />",
+                points.join(" "),
+                if z.filled { "0.3" } else { "0" },
+                if z.filled { "" } else { " stroke-dasharray=\"0.6 0.4\"" },
+            ));
+            for cut in &z.cutouts {
+                let cut_points: Vec<String> =
+                    cut.iter().map(|pt| format!("{} {}", pt.x, pt.y)).collect();
+                s.push_str(&format!(
+                    "<polygon points=\"{}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"0.1\" stroke-dasharray=\"0.6 0.3\"/>",
+                    cut_points.join(" ")
+                ));
+            }
+        }
         for t in &p.board.tracks {
             s.push_str(&format!("<path d=\"M {} {} L {} {}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{}\" stroke-linecap=\"round\"/>",t.start.x,t.start.y,t.end.x,t.end.y,if t.layer==pcbcraft_doc::Layer::Front {"#f58d79"} else {"#74a7ec"},t.width));
+        }
+        for v in &p.board.vias {
+            s.push_str(&format!("<circle cx=\"{}\" cy=\"{}\" r=\"{}\" fill=\"#f58d79\" stroke=\"#f58d79\" stroke-width=\"0.05\"/>",v.position.x,v.position.y,v.diameter/2.0));
+            if v.drill > 0.0 {
+                s.push_str(&format!(
+                    "<circle cx=\"{}\" cy=\"{}\" r=\"{}\" fill=\"#131c29\"/>",
+                    v.position.x,
+                    v.position.y,
+                    v.drill / 2.0
+                ));
+            }
+        }
+        for t in &p.board.texts {
+            let spin = if t.rotation == 0.0 {
+                String::new()
+            } else {
+                format!(
+                    " transform=\"rotate({} {} {})\"",
+                    -t.rotation, t.position.x, t.position.y
+                )
+            };
+            s.push_str(&format!(
+                "<text x=\"{}\" y=\"{}\" font-size=\"{}\" fill=\"{}\"{}>{}</text>",
+                t.position.x,
+                t.position.y,
+                t.size,
+                if t.layer == pcbcraft_doc::Layer::Front {
+                    "#dbe7f2"
+                } else {
+                    "#9ec5ff"
+                },
+                spin,
+                escape(&t.text)
+            ));
+        }
+        for g in p.graphics.iter().filter(|g| g.layer == "board") {
+            s.push_str(&project_graphic_svg(g));
         }
         for f in &p.board.footprints {
             if let Some(library) = p
@@ -318,6 +455,38 @@ pub fn svg(p: &Project, view: &str) -> Result<String, String> {
                     .collect::<Vec<_>>()
                     .join(" ");
                 s.push_str(&format!("<polyline points=\"{points}\" fill=\"none\" stroke=\"#5ae0bc\" stroke-width=\"0.2\"/>"));
+            }
+        }
+        for w in &p.drawn_wires {
+            let points = w
+                .points
+                .iter()
+                .map(|p| format!("{},{}", p.x, p.y))
+                .collect::<Vec<_>>()
+                .join(" ");
+            s.push_str(&format!("<polyline points=\"{points}\" fill=\"none\" stroke=\"#5ae0bc\" stroke-width=\"0.2\"/>"));
+        }
+        for g in p.graphics.iter().filter(|g| g.layer == "schematic") {
+            s.push_str(&project_graphic_svg(g));
+        }
+        for l in &p.labels {
+            if l.kind == "junction" {
+                s.push_str(&format!(
+                    "<circle cx=\"{}\" cy=\"{}\" r=\"0.35\" fill=\"#5ae0bc\"/>",
+                    l.position.x, l.position.y
+                ));
+            } else {
+                s.push_str(&format!(
+                    "<text x=\"{}\" y=\"{}\">{}</text>",
+                    l.position.x,
+                    l.position.y,
+                    escape(&label_text(l, p.net_name(l.net)))
+                ));
+            }
+        }
+        for f in &p.no_connects {
+            if let Some(point) = p.pin_position(&f.pin) {
+                s.push_str(&format!("<path d=\"M {} {} L {} {} M {} {} L {} {}\" stroke=\"#f58d79\" stroke-width=\"0.25\"/>",point.x-0.6,point.y-0.6,point.x+0.6,point.y+0.6,point.x-0.6,point.y+0.6,point.x+0.6,point.y-0.6));
             }
         }
         for c in p.components.iter().flat_map(|c| c.schematic_views()) {
@@ -400,6 +569,25 @@ pub fn preview_png(p: &Project, view: &str) -> Result<Vec<u8>, String> {
                 [19, 28, 41],
             );
         }
+        for z in &p.board.zones {
+            let color = if z.layer == pcbcraft_doc::Layer::Front {
+                [245, 141, 121]
+            } else {
+                [116, 167, 236]
+            };
+            let points: Vec<Point> = z.outline.iter().map(|pt| to_pixel(*pt)).collect();
+            if z.filled {
+                fill_polygon(&mut image, &points, color);
+            } else {
+                for w in points.windows(2) {
+                    line(&mut image, w[0], w[1], 0.6, color);
+                }
+            }
+            for cut in &z.cutouts {
+                let points: Vec<Point> = cut.iter().map(|pt| to_pixel(*pt)).collect();
+                fill_polygon(&mut image, &points, [25, 58, 54]);
+            }
+        }
         for t in &p.board.tracks {
             line(
                 &mut image,
@@ -412,6 +600,34 @@ pub fn preview_png(p: &Project, view: &str) -> Result<Vec<u8>, String> {
                     [116, 167, 236]
                 },
             );
+        }
+        for v in &p.board.vias {
+            let point = to_pixel(v.position);
+            let radius = (v.diameter / 2.0 * scale).max(1.0);
+            line(
+                &mut image,
+                Point::new(point.x - radius, point.y),
+                Point::new(point.x + radius, point.y),
+                radius * 2.0,
+                [245, 141, 121],
+            );
+            if v.drill > 0.0 {
+                let hole = (v.drill / 2.0 * scale).max(0.5);
+                line(
+                    &mut image,
+                    Point::new(point.x - hole, point.y),
+                    Point::new(point.x + hole, point.y),
+                    hole * 2.0,
+                    [19, 28, 41],
+                );
+            }
+        }
+        for g in p.graphics.iter().filter(|g| g.layer == "board") {
+            for pair in g.outline().unwrap_or_default().windows(2) {
+                if let (Some(a), Some(b)) = (pair.first(), pair.get(1)) {
+                    line(&mut image, to_pixel(*a), to_pixel(*b), 1.0, [220, 220, 220]);
+                }
+            }
         }
         for f in &p.board.footprints {
             if let Some(library) = p
@@ -450,6 +666,49 @@ pub fn preview_png(p: &Project, view: &str) -> Result<Vec<u8>, String> {
                         line(&mut image, to_pixel(*a), to_pixel(*b), 1.0, [90, 224, 188]);
                     }
                 }
+            }
+        }
+        for w in &p.drawn_wires {
+            for pair in w.points.windows(2) {
+                if let (Some(a), Some(b)) = (pair.first(), pair.get(1)) {
+                    line(&mut image, to_pixel(*a), to_pixel(*b), 1.0, [90, 224, 188]);
+                }
+            }
+        }
+        for g in p.graphics.iter().filter(|g| g.layer == "schematic") {
+            for pair in g.outline().unwrap_or_default().windows(2) {
+                if let (Some(a), Some(b)) = (pair.first(), pair.get(1)) {
+                    line(&mut image, to_pixel(*a), to_pixel(*b), 1.0, [90, 224, 188]);
+                }
+            }
+        }
+        for l in p.labels.iter().filter(|l| l.kind == "junction") {
+            let point = to_pixel(l.position);
+            line(
+                &mut image,
+                Point::new(point.x - 2.0, point.y),
+                Point::new(point.x + 2.0, point.y),
+                2.0,
+                [90, 224, 188],
+            );
+        }
+        for f in &p.no_connects {
+            if let Some(anchor) = p.pin_position(&f.pin) {
+                let point = to_pixel(anchor);
+                line(
+                    &mut image,
+                    Point::new(point.x - 3.0, point.y - 3.0),
+                    Point::new(point.x + 3.0, point.y + 3.0),
+                    1.0,
+                    [245, 141, 121],
+                );
+                line(
+                    &mut image,
+                    Point::new(point.x - 3.0, point.y + 3.0),
+                    Point::new(point.x + 3.0, point.y - 3.0),
+                    1.0,
+                    [245, 141, 121],
+                );
             }
         }
         for c in p.components.iter().flat_map(|c| c.schematic_views()) {
@@ -555,6 +814,45 @@ fn line(image: &mut image::RgbImage, a: Point, b: Point, r: f64, color: [u8; 3])
     }
 }
 
+fn fill_polygon(image: &mut image::RgbImage, points: &[Point], color: [u8; 3]) {
+    // Scanline fill in pixel space: pixel centres inside the polygon get the
+    // zone colour. Hostile or off-view geometry is clipped to the image.
+    if points.len() < 3 {
+        return;
+    }
+    let top = points
+        .iter()
+        .map(|p| p.y)
+        .fold(f64::INFINITY, f64::min)
+        .max(0.0) as u32;
+    let bottom = points
+        .iter()
+        .map(|p| p.y)
+        .fold(f64::NEG_INFINITY, f64::max)
+        .min(679.0) as u32;
+    for y in top..=bottom {
+        let row = f64::from(y) + 0.5;
+        let mut crossings: Vec<f64> = vec![];
+        for edge in points.windows(2) {
+            let (a, b) = (edge[0], edge[1]);
+            if (a.y > row) != (b.y > row) {
+                crossings.push(a.x + (row - a.y) * (b.x - a.x) / (b.y - a.y));
+            }
+        }
+        crossings.sort_by(f64::total_cmp);
+        for pair in crossings.chunks(2) {
+            if pair.len() < 2 {
+                continue;
+            }
+            let left = pair[0].max(0.0) as u32;
+            let right = (pair[1].min(999.0) as u32).min(999);
+            for x in left..=right {
+                image.put_pixel(x, y, image::Rgb(color));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +912,7 @@ mod tests {
                 library: "Resistor_SMD".into(),
                 definition: footprint,
             }),
+            fields: vec![],
         });
         project.board.footprints.push(pcbcraft_doc::Footprint {
             id: 2,
@@ -903,6 +1202,279 @@ mod tests {
         assert_eq!(exported.name, "pcbcraft_Edited0805");
         assert!(!board.contains("project:Edited0805"));
         assert_eq!(exported.pads.len(), 2);
+        Ok(())
+    }
+    #[test]
+    fn drawn_wires_render_in_the_schematic_preview_without_components() -> Result<(), String> {
+        let mut project = Project::default();
+        project.drawn_wires.push(pcbcraft_doc::DrawnWire {
+            id: 1,
+            net: None,
+            points: vec![
+                Point::new(10.0, 10.0),
+                Point::new(20.0, 10.0),
+                Point::new(20.0, 20.0),
+            ],
+        });
+        project.validate()?;
+        let schematic = svg(&project, "schematic")?;
+        assert!(
+            schematic.contains("points=\"10,10 20,10 20,20\""),
+            "drawn wire vertices must render in order"
+        );
+        Ok(())
+    }
+    #[test]
+    fn rotated_board_text_carries_its_angle_in_the_pcb_preview() -> Result<(), String> {
+        let mut project = Project::default();
+        project.board.texts.push(pcbcraft_doc::BoardText {
+            id: 1,
+            text: "Acme Labs".into(),
+            position: Point::new(10.0, 5.0),
+            size: 2.0,
+            layer: pcbcraft_doc::Layer::Front,
+            rotation: 90.0,
+        });
+        project.board.texts.push(pcbcraft_doc::BoardText {
+            id: 2,
+            text: "Rev B".into(),
+            position: Point::new(30.0, 5.0),
+            size: 1.0,
+            layer: pcbcraft_doc::Layer::Back,
+            rotation: 0.0,
+        });
+        project.validate()?;
+        let pcb = svg(&project, "pcb")?;
+        assert!(
+            pcb.contains("<text x=\"10\" y=\"5\" font-size=\"2\" fill=\"#dbe7f2\" transform=\"rotate(-90 10 5)\">Acme Labs</text>"),
+            "a turned label must render with its angle about the anchor"
+        );
+        assert!(
+            pcb.contains("<text x=\"30\" y=\"5\" font-size=\"1\" fill=\"#9ec5ff\">Rev B</text>"),
+            "an upright label keeps the plain form"
+        );
+        Ok(())
+    }
+    #[test]
+    fn zones_render_in_the_pcb_previews() -> Result<(), String> {
+        let mut project = Project::default();
+        project.nets.push(pcbcraft_doc::Net {
+            id: 1,
+            name: "GND".into(),
+            ..Default::default()
+        });
+        project.board.zones.push(pcbcraft_doc::CopperZone {
+            id: 2,
+            net: 1,
+            layer: pcbcraft_doc::Layer::Front,
+            outline: vec![
+                Point::new(5.0, 5.0),
+                Point::new(45.0, 5.0),
+                Point::new(45.0, 25.0),
+                Point::new(5.0, 25.0),
+                Point::new(5.0, 5.0),
+            ],
+            cutouts: vec![vec![
+                Point::new(30.0, 15.0),
+                Point::new(40.0, 15.0),
+                Point::new(40.0, 20.0),
+                Point::new(30.0, 20.0),
+                Point::new(30.0, 15.0),
+            ]],
+            filled: true,
+        });
+        project.validate()?;
+        let pcb = svg(&project, "pcb")?;
+        assert!(
+            pcb.contains(
+                "<polygon points=\"5 5 45 5 45 25 5 25 5 5\" fill=\"#f58d79\" fill-opacity=\"0.3\""
+            ),
+            "the zone outline must render as a filled copper polygon"
+        );
+        assert!(
+            pcb.contains("<polygon points=\"30 15 40 15 40 20 30 20 30 15\" fill=\"none\""),
+            "the zone cutout must render as an unfilled dashed outline"
+        );
+        let image = image::load_from_memory(&preview_png(&project, "pcb")?)
+            .map_err(|e| e.to_string())?
+            .to_rgb8();
+        assert_eq!(
+            image.get_pixel(500, 200).0,
+            [245, 141, 121],
+            "inside the zone the copper colour must be painted"
+        );
+        assert_eq!(
+            image.get_pixel(700, 400).0,
+            [25, 58, 54],
+            "inside the zone cutout the substrate colour must show through"
+        );
+        assert_eq!(
+            image.get_pixel(100, 600).0,
+            [25, 58, 54],
+            "outside the zone the board keeps its substrate colour"
+        );
+        Ok(())
+    }
+    #[test]
+    fn vias_render_pad_and_drill_in_the_pcb_preview() -> Result<(), String> {
+        let mut project = Project::default();
+        project.nets.push(pcbcraft_doc::Net {
+            id: 1,
+            name: "GND".into(),
+            ..Default::default()
+        });
+        project.board.vias.push(pcbcraft_doc::Via {
+            id: 2,
+            net: 1,
+            position: Point::new(30.0, 20.0),
+            diameter: 1.4,
+            drill: 0.8,
+        });
+        project.validate()?;
+        let pcb = svg(&project, "pcb")?;
+        assert!(
+            pcb.contains("<circle cx=\"30\" cy=\"20\" r=\"0.7\""),
+            "the via pad must render at half its diameter"
+        );
+        assert!(
+            pcb.contains("<circle cx=\"30\" cy=\"20\" r=\"0.4\" fill=\"#131c29\""),
+            "the drilled hole must render as board interior"
+        );
+        Ok(())
+    }
+    #[test]
+    fn labels_and_no_connect_flags_render_in_the_schematic_preview() -> Result<(), String> {
+        let mut project = Project::default();
+        project.nets.push(pcbcraft_doc::Net {
+            id: 1,
+            name: "VCC".into(),
+            ..Default::default()
+        });
+        project.components.push(pcbcraft_doc::Component {
+            id: 3,
+            reference: "R9".into(),
+            value: "1 k".into(),
+            kind: "resistor".into(),
+            position: Point::new(50.0, 30.0),
+            rotation: 0.0,
+            pins: vec![
+                pcbcraft_doc::Pin {
+                    number: "1".into(),
+                    name: String::new(),
+                    offset: Point::new(-1.0, 0.0),
+                    net: None,
+                    electrical_type: "passive".into(),
+                    direction: Some(180.0),
+                    unit: 1,
+                },
+                pcbcraft_doc::Pin {
+                    number: "2".into(),
+                    name: String::new(),
+                    offset: Point::new(1.0, 0.0),
+                    net: None,
+                    electrical_type: "passive".into(),
+                    direction: Some(0.0),
+                    unit: 1,
+                },
+            ],
+            units: vec![],
+            library_symbol: None,
+            library_footprint: None,
+            fields: vec![],
+        });
+        project.drawn_wires.push(pcbcraft_doc::DrawnWire {
+            id: 2,
+            net: Some(1),
+            points: vec![Point::new(10.0, 5.0), Point::new(20.0, 5.0)],
+        });
+        project.labels.push(pcbcraft_doc::Label {
+            id: 4,
+            kind: "global".into(),
+            net: 1,
+            position: Point::new(10.0, 5.0),
+            rotation: 0.0,
+        });
+        project.labels.push(pcbcraft_doc::Label {
+            id: 5,
+            kind: "junction".into(),
+            net: 1,
+            position: Point::new(20.0, 5.0),
+            rotation: 0.0,
+        });
+        project.no_connects.push(pcbcraft_doc::NoConnectFlag {
+            id: 6,
+            pin: pcbcraft_doc::PinRef {
+                component: 3,
+                pin: "2".into(),
+            },
+        });
+        project.validate()?;
+        let schematic = svg(&project, "schematic")?;
+        assert!(
+            schematic.contains(">{VCC}</text>"),
+            "a global label must render its braced net name"
+        );
+        assert!(
+            schematic.contains("<circle cx=\"20\" cy=\"5\" r=\"0.35\""),
+            "a junction must render as a dot on its wire vertex"
+        );
+        assert!(
+            schematic.contains("stroke=\"#f58d79\""),
+            "a no-connect flag must render its cross at the pin"
+        );
+        Ok(())
+    }
+    #[test]
+    fn graphics_render_outlines_and_text_in_previews() -> Result<(), String> {
+        let mut project = Project::default();
+        project.graphics.push(pcbcraft_doc::Graphic {
+            id: 1,
+            layer: "schematic".into(),
+            shape: "rect".into(),
+            points: vec![Point::new(10.0, 10.0), Point::new(20.0, 15.0)],
+            width: 0.2,
+            text: String::new(),
+        });
+        project.graphics.push(pcbcraft_doc::Graphic {
+            id: 2,
+            layer: "schematic".into(),
+            shape: "text".into(),
+            points: vec![Point::new(12.0, 12.0)],
+            width: 1.5,
+            text: "REV B".into(),
+        });
+        project.graphics.push(pcbcraft_doc::Graphic {
+            id: 3,
+            layer: "board".into(),
+            shape: "circle".into(),
+            points: vec![Point::new(30.0, 20.0)],
+            width: 4.0,
+            text: String::new(),
+        });
+        project.validate()?;
+        let schematic = svg(&project, "schematic")?;
+        assert!(
+            schematic.contains("points=\"10,10 20,10 20,15 10,15 10,10\""),
+            "rect graphic must render as a closed outline"
+        );
+        assert!(
+            schematic.contains(">REV B</text>"),
+            "text graphic must render its content"
+        );
+        assert!(
+            !schematic.contains("30,20"),
+            "board graphics must not leak into the schematic preview"
+        );
+        let pcb = svg(&project, "pcb")?;
+        let circle = pcb
+            .match_indices("<polyline points=\"34")
+            .next()
+            .map(|(i, _)| i)
+            .ok_or("circle graphic missing from the pcb preview")?;
+        assert!(
+            pcb[circle..].contains("30,24"),
+            "circle must pass through its topmost point"
+        );
         Ok(())
     }
     #[test]
