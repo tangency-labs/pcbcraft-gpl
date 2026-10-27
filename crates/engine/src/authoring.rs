@@ -10,6 +10,12 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         ("library.load","Load and validate a .pcbcraft-lib collection into the project as one undoable transaction",schema(json!({"path":{"type":"string"}}),&["path"])),
         ("component.place_custom","Place a symbol from the editable project library",schema(json!({"name":{"type":"string"},"position":point_schema(),"reference":{"type":"string"},"value":{"type":"string"}}),&["name","position"])),
         ("footprint.assign_custom","Assign a project-library footprint whose pad numbers match the component pins",schema(json!({"id":id_schema(),"name":{"type":"string"}}),&["id","name"])),
+        ("library.footprint.set_model","Attach or replace a 3D model reference on a project-library footprint: a file path with an optional offset, scale and rotation in millimetres and degrees; placed instances keep their embedded copy",schema(json!({"name":{"type":"string"},"path":{"type":"string","maxLength":1024},"offset":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"scale":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"rotate":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3}}),&["name","path"])),
+        ("library.footprint.clear_model","Remove the 3D model reference from a project-library footprint",schema(json!({"name":{"type":"string"}}),&["name"])),
+        ("library.footprint.set_rules","Set design rule overrides on a project-library footprint: a local copper clearance and solder mask/paste margin shifts in millimetres; the clearance tightens clearance checks while the margins are recorded and exported",schema(json!({"name":{"type":"string"},"clearance":{"type":"number"},"mask_margin":{"type":"number"},"paste_margin":{"type":"number"}}),&["name"])),
+        ("library.footprint.clear_rules","Remove the design rule overrides from a project-library footprint",schema(json!({"name":{"type":"string"}}),&["name"])),
+        ("library.footprint.renumber_pads","Renumber pads on a project-library footprint with an ordered old-to-new map; embedded copies, their placed pads and matching component pins follow, and a target number already held by an untouched pad is refused",schema(json!({"name":{"type":"string"},"renames":{"type":"array","maxItems":512,"items":{"type":"object","properties":{"old":{"type":"string","maxLength":32},"new":{"type":"string","maxLength":32}},"required":["old","new"],"additionalProperties":false}}}),&["name","renames"])),
+        ("library.footprint.generate_courtyard","Generate a courtyard rectangle on a project-library footprint: the outline of its pads and artwork grown by a margin, replacing any courtyard the footprint already carries",schema(json!({"name":{"type":"string"},"margin":{"type":"number","minimum":0,"maximum":5,"description":"ring beyond the outermost copper and artwork, millimetres"}}),&["name","margin"])),
     ].into_iter().map(|(id,description,input_schema)|CommandSpec {id,description,input_schema}).collect()
 }
 #[derive(Deserialize)]
@@ -17,6 +23,24 @@ pub(super) fn commands() -> Vec<CommandSpec> {
 struct SymbolParams {
     definition: SymbolDefinition,
     notice: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PadRename {
+    old: String,
+    new: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenumberParams {
+    name: String,
+    renames: Vec<PadRename>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CourtyardParams {
+    name: String,
+    margin: f64,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +52,29 @@ struct FootprintParams {
 #[serde(deny_unknown_fields)]
 struct PathParams {
     path: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelParams {
+    name: String,
+    path: String,
+    #[serde(default)]
+    offset: Option<[f64; 3]>,
+    #[serde(default)]
+    scale: Option<[f64; 3]>,
+    #[serde(default)]
+    rotate: Option<[f64; 3]>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RulesParams {
+    name: String,
+    #[serde(default)]
+    clearance: Option<f64>,
+    #[serde(default)]
+    mask_margin: Option<f64>,
+    #[serde(default)]
+    paste_margin: Option<f64>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -114,6 +161,338 @@ pub(super) fn run(
                 }
             }
             Ok(json!({"name":a.name}))
+        }
+        "library.footprint.set_model" => {
+            let a: ModelParams = parse(params)?;
+            if a.path.is_empty() || a.path.len() > 1024 {
+                return Err(Error::Invalid("model path must be 1 to 1024 bytes".into()));
+            }
+            let sane = |v: &Option<[f64; 3]>, positive: bool| {
+                v.is_none_or(|t| {
+                    t.iter()
+                        .all(|x| x.is_finite() && x.abs() <= 100_000.0 && (!positive || *x > 0.0))
+                })
+            };
+            if !sane(&a.offset, false) || !sane(&a.rotate, false) || !sane(&a.scale, true) {
+                return Err(Error::Invalid(
+                    "model transforms must be finite, scales positive".into(),
+                ));
+            }
+            let def = p
+                .library
+                .footprints
+                .iter_mut()
+                .find(|s| s.name == a.name)
+                .ok_or_else(missing)?;
+            let offset = a.offset.unwrap_or([0.0; 3]);
+            let scale = a.scale.unwrap_or([1.0; 3]);
+            let rotate = a.rotate.unwrap_or([0.0; 3]);
+            let raw_source = format!(
+                "(model \"{}\" (offset (xyz {} {} {})) (scale (xyz {} {} {})) (rotate (xyz {} {} {})))",
+                a.path,
+                offset[0],
+                offset[1],
+                offset[2],
+                scale[0],
+                scale[1],
+                scale[2],
+                rotate[0],
+                rotate[1],
+                rotate[2]
+            );
+            def.model = Some(pcbcraft_library::Model3D {
+                path: a.path,
+                offset,
+                scale,
+                rotate,
+                raw_source,
+            });
+            def.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+            Ok(json!({"name": a.name, "path": def.model.as_ref().map(|m| m.path.clone())}))
+        }
+        "library.footprint.clear_model" => {
+            let a: Name = parse(params)?;
+            let def = p
+                .library
+                .footprints
+                .iter_mut()
+                .find(|s| s.name == a.name)
+                .ok_or_else(missing)?;
+            if def.model.is_none() {
+                return Err(missing());
+            }
+            def.model = None;
+            def.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+            Ok(json!({"name": a.name}))
+        }
+        "library.footprint.set_rules" => {
+            let a: RulesParams = parse(params)?;
+            if a.clearance.is_none() && a.mask_margin.is_none() && a.paste_margin.is_none() {
+                return Err(Error::Invalid("set at least one rule override".into()));
+            }
+            let bounded = |v: &Option<f64>| v.is_none_or(|x| x.is_finite() && x.abs() <= 100.0);
+            if !bounded(&a.clearance) || !bounded(&a.mask_margin) || !bounded(&a.paste_margin) {
+                return Err(Error::Invalid(
+                    "rule overrides must be finite and at most 100 mm".into(),
+                ));
+            }
+            let def = p
+                .library
+                .footprints
+                .iter_mut()
+                .find(|s| s.name == a.name)
+                .ok_or_else(missing)?;
+            def.rules = Some(pcbcraft_library::FootprintRules {
+                clearance: a.clearance,
+                mask_margin: a.mask_margin,
+                paste_margin: a.paste_margin,
+            });
+            def.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+            Ok(json!({"name": a.name, "rules": def.rules}))
+        }
+        "library.footprint.clear_rules" => {
+            let a: Name = parse(params)?;
+            let def = p
+                .library
+                .footprints
+                .iter_mut()
+                .find(|s| s.name == a.name)
+                .ok_or_else(missing)?;
+            if def.rules.is_none() {
+                return Err(missing());
+            }
+            def.rules = None;
+            def.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+            Ok(json!({"name": a.name}))
+        }
+        "library.footprint.generate_courtyard" => {
+            let a: CourtyardParams = parse(params)?;
+            if !a.margin.is_finite() || !(0.0..=5.0).contains(&a.margin) {
+                return Err(Error::Invalid(
+                    "the courtyard margin must be 0 to 5 millimetres".into(),
+                ));
+            }
+            let def = p
+                .library
+                .footprints
+                .iter_mut()
+                .find(|s| s.name == a.name)
+                .ok_or_else(missing)?;
+            let mut min = Point::new(f64::MAX, f64::MAX);
+            let mut max = Point::new(f64::MIN, f64::MIN);
+            let grow = |p: &mut Point, q: &mut Point, at: Point, radius: f64| {
+                if !at.valid() || !radius.is_finite() || radius < 0.0 {
+                    return;
+                }
+                p.x = p.x.min(at.x - radius);
+                p.y = p.y.min(at.y - radius);
+                q.x = q.x.max(at.x + radius);
+                q.y = q.y.max(at.y + radius);
+            };
+            for pad in &def.pads {
+                let half_x = pad.size.x / 2.0;
+                let half_y = pad.size.y / 2.0;
+                let (c, s) = (
+                    pad.rotation.to_radians().cos(),
+                    pad.rotation.to_radians().sin(),
+                );
+                let reach = (half_x * c).abs() + (half_y * s).abs();
+                let reach_y = (half_x * s).abs() + (half_y * c).abs();
+                grow(&mut min, &mut max, pad.position, reach.max(reach_y));
+            }
+            for graphic in &def.graphics {
+                if matches!(
+                    graphic,
+                    pcbcraft_library::Graphic::Rectangle { layer, .. }
+                        if layer == "pcbcraft.courtyard"
+                ) {
+                    continue;
+                }
+                let (points, radius): (Vec<Point>, f64) = match graphic {
+                    pcbcraft_library::Graphic::Line {
+                        start, end, width, ..
+                    } => (vec![*start, *end], *width / 2.0),
+                    pcbcraft_library::Graphic::Rectangle {
+                        start, end, width, ..
+                    } => (vec![*start, *end], *width / 2.0),
+                    pcbcraft_library::Graphic::Circle {
+                        center,
+                        radius,
+                        width,
+                        ..
+                    } => (vec![*center], *radius + width / 2.0),
+                    pcbcraft_library::Graphic::Arc {
+                        start,
+                        mid,
+                        end,
+                        width,
+                        ..
+                    } => (vec![*start, *mid, *end], *width / 2.0),
+                    pcbcraft_library::Graphic::Polyline { points, width, .. } => {
+                        (points.clone(), *width / 2.0)
+                    }
+                    _ => (vec![], 0.0),
+                };
+                for at in points {
+                    grow(&mut min, &mut max, at, radius);
+                }
+            }
+            if min.x > max.x || min.y > max.y {
+                return Err(Error::Invalid(
+                    "this footprint has no pads or artwork to surround".into(),
+                ));
+            }
+            let before = def.graphics.len();
+            def.graphics
+                .retain(|g| !matches!(g, pcbcraft_library::Graphic::Rectangle { layer, .. } if layer == "pcbcraft.courtyard"));
+            def.graphics.push(pcbcraft_library::Graphic::Rectangle {
+                start: Point::new(min.x - a.margin, min.y - a.margin),
+                end: Point::new(max.x + a.margin, max.y + a.margin),
+                width: 0.1,
+                fill: String::new(),
+                layer: "pcbcraft.courtyard".into(),
+            });
+            if let Err(e) = def.validate() {
+                def.graphics.truncate(before);
+                return Err(Error::Invalid(e.to_string()));
+            }
+            Ok(json!({
+                "name": a.name,
+                "courtyard": [
+                    min.x - a.margin,
+                    min.y - a.margin,
+                    max.x + a.margin,
+                    max.y + a.margin
+                ],
+                "margin": a.margin
+            }))
+        }
+        "library.footprint.renumber_pads" => {
+            let a: RenumberParams = parse(params)?;
+            if a.renames.is_empty() || a.renames.len() > 512 {
+                return Err(Error::Invalid(
+                    "pad renumbering needs 1 to 512 old-new pairs".into(),
+                ));
+            }
+            for r in &a.renames {
+                if r.old.is_empty() || r.new.is_empty() || r.old.len() > 32 || r.new.len() > 32 {
+                    return Err(Error::Invalid("pad numbers must be 1 to 32 bytes".into()));
+                }
+            }
+            let mut sources: Vec<&str> = a.renames.iter().map(|r| r.old.as_str()).collect();
+            sources.sort_unstable();
+            sources.dedup();
+            if sources.len() != a.renames.len() {
+                return Err(Error::Invalid(
+                    "each old pad number may appear once in the map".into(),
+                ));
+            }
+            let targets: Vec<&str> = a.renames.iter().map(|r| r.new.as_str()).collect();
+            let mut dedup: Vec<&str> = targets.clone();
+            dedup.sort_unstable();
+            dedup.dedup();
+            if dedup.len() != targets.len() {
+                return Err(Error::Invalid(
+                    "two pads cannot be renumbered to the same number".into(),
+                ));
+            }
+            let def = p
+                .library
+                .footprints
+                .iter_mut()
+                .find(|s| s.name == a.name)
+                .ok_or_else(missing)?;
+            for r in &a.renames {
+                if !def.pads.iter().any(|pad| pad.number == r.old) {
+                    return Err(Error::Invalid(format!(
+                        "this footprint has no pad {}",
+                        r.old
+                    )));
+                }
+            }
+            for target in &targets {
+                if !a.renames.iter().any(|r| r.old == **target)
+                    && def.pads.iter().any(|pad| pad.number == **target)
+                {
+                    return Err(Error::Invalid(format!(
+                        "pad number {target} is already used by a pad this map leaves alone"
+                    )));
+                }
+            }
+            let touched: Vec<(usize, String)> = def
+                .pads
+                .iter()
+                .enumerate()
+                .filter(|(_, pad)| a.renames.iter().any(|r| r.old == pad.number))
+                .map(|(i, pad)| (i, pad.number.clone()))
+                .collect();
+            for &(i, _) in &touched {
+                def.pads[i].number = String::new();
+            }
+            for (i, old) in &touched {
+                if let Some(r) = a.renames.iter().find(|r| r.old == *old) {
+                    def.pads[*i].number = r.new.clone();
+                }
+            }
+            if def.pads.iter().any(|pad| pad.number.is_empty()) {
+                return Err(Error::Invalid(
+                    "every renamed pad needs a new number".into(),
+                ));
+            }
+            def.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+            let affected: Vec<Id> = p
+                .components
+                .iter()
+                .filter(|c| {
+                    c.library_footprint
+                        .as_ref()
+                        .is_some_and(|f| f.definition.name == a.name)
+                })
+                .map(|c| c.id)
+                .collect();
+            for c in &mut p.components {
+                if !affected.contains(&c.id) {
+                    continue;
+                }
+                if let Some(embedded) = &mut c.library_footprint {
+                    for pad in &mut embedded.definition.pads {
+                        if let Some(r) = a.renames.iter().find(|r| r.old == pad.number) {
+                            pad.number = r.new.clone();
+                        }
+                    }
+                }
+                for pin in &mut c.pins {
+                    if let Some(r) = a.renames.iter().find(|r| r.old == pin.number) {
+                        pin.number = r.new.clone();
+                    }
+                }
+            }
+            for f in &mut p.board.footprints {
+                if !affected.contains(&f.component) {
+                    continue;
+                }
+                for pad in &mut f.pads {
+                    if let Some(r) = a.renames.iter().find(|r| r.old == pad.number) {
+                        pad.number = r.new.clone();
+                    }
+                    let geometry_new = pad.geometry.as_ref().and_then(|geometry| {
+                        a.renames
+                            .iter()
+                            .find(|r| r.old == geometry.number)
+                            .map(|r| r.new.clone())
+                    });
+                    if let (Some(geometry), Some(new)) =
+                        (pad.geometry.as_mut(), geometry_new.as_deref())
+                    {
+                        geometry.number = new.to_string();
+                    }
+                }
+            }
+            Ok(json!({
+                "name": a.name,
+                "renamed": touched.len(),
+                "components": affected.len()
+            }))
         }
         "library.load" => {
             let a: PathParams = parse(params)?;
