@@ -124,6 +124,8 @@ fn new_footprint() -> FootprintDefinition {
         keywords: String::new(),
         pads: vec![new_pad("1", -2.5), new_pad("2", 2.5)],
         graphics: vec![rectangle("F.SilkS")],
+        model: None,
+        rules: None,
         raw_source: String::new(),
         unsupported: vec![],
     }
