@@ -619,6 +619,66 @@ impl App {
                 );
             }
         }
+        for w in &p.drawn_wires {
+            painter.add(egui::Shape::line(
+                w.points
+                    .iter()
+                    .map(|point| camera.screen(*point, rect))
+                    .collect(),
+                Stroke::new(1.8, self.accent()),
+            ));
+        }
+        for g in p.graphics.iter().filter(|g| g.layer == "schematic") {
+            if let Some(outline) = g.outline() {
+                painter.add(egui::Shape::line(
+                    outline
+                        .iter()
+                        .map(|point| camera.screen(*point, rect))
+                        .collect(),
+                    Stroke::new(1.6, self.accent()),
+                ));
+            } else if let Some(anchor) = g.points.first() {
+                painter.text(
+                    camera.screen(*anchor, rect),
+                    Align2::LEFT_TOP,
+                    &g.text,
+                    FontId::proportional(g.width as f32),
+                    self.accent(),
+                );
+            }
+        }
+        for l in &p.labels {
+            let at = camera.screen(l.position, rect);
+            if l.kind == "junction" {
+                painter.circle_filled(at, 3.0, self.accent());
+            } else {
+                let text = match l.kind.as_str() {
+                    "global" => format!("{{{}}}", p.net_name(l.net)),
+                    "hierarchical" => format!("/{}", p.net_name(l.net)),
+                    _ => p.net_name(l.net).to_string(),
+                };
+                painter.text(
+                    at,
+                    Align2::CENTER_BOTTOM,
+                    text,
+                    FontId::monospace(11.0),
+                    self.accent(),
+                );
+            }
+        }
+        for f in &p.no_connects {
+            if let Some(anchor) = p.pin_position(&f.pin) {
+                let at = camera.screen(anchor, rect);
+                painter.line_segment(
+                    [at + egui::vec2(-4.0, -4.0), at + egui::vec2(4.0, 4.0)],
+                    Stroke::new(1.6, egui::Color32::from_rgb(245, 141, 121)),
+                );
+                painter.line_segment(
+                    [at + egui::vec2(-4.0, 4.0), at + egui::vec2(4.0, -4.0)],
+                    Stroke::new(1.6, egui::Color32::from_rgb(245, 141, 121)),
+                );
+            }
+        }
         for c in p.components.iter().flat_map(|c| c.schematic_views()) {
             self.symbol(
                 painter,
@@ -872,6 +932,26 @@ impl App {
                     },
                 ),
             );
+        }
+        for v in &p.board.vias {
+            let at = camera.screen(v.position, rect);
+            let radius = (v.diameter as f32 / 2.0 * camera.zoom).max(2.0);
+            painter.circle_filled(
+                at,
+                radius,
+                if self.selected == Some(v.id) {
+                    self.accent()
+                } else {
+                    Color32::from_rgb(245, 141, 121)
+                },
+            );
+            if v.drill > 0.0 {
+                painter.circle_filled(
+                    at,
+                    (v.drill as f32 / 2.0 * camera.zoom).max(1.0),
+                    Color32::from_rgb(19, 28, 41),
+                );
+            }
         }
         for f in &p.board.footprints {
             let points = f
