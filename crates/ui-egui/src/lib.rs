@@ -6,21 +6,321 @@ use egui::{Align2, Color32, FontId, Rect, Stroke, Vec2};
 use pcbcraft_doc::{Id, PinRef, Project, TEMPLATES};
 use pcbcraft_geom::Point;
 use pcbcraft_mcp::SharedSession;
+
+/// Guidance shown when a panel section has no content yet: what belongs
+/// there and the command that fills it, so a first-run user is never left
+/// staring at a blank list.
+const EMPTY_SYMBOLS: &str =
+    "No symbols yet. Press A to open the symbol palette, or run component.add to add one.";
+const EMPTY_NETS: &str = "No nets yet. Nets form when pins are wired together, or import a netlist with netlist.import and board.sync will create the packages.";
+const EMPTY_BOARD: &str =
+    "No packages on the board yet. Run board.sync to place a package for every symbol.";
+const EMPTY_CHECKS: &str =
+    "Checks run automatically on every edit; findings are listed here as soon as one appears.";
+
+/// Render an empty-state line in the small muted style.
+fn empty_state(ui: &mut egui::Ui, text: &str, muted: egui::Color32) {
+    ui.label(egui::RichText::new(text).small().color(muted));
+}
+
+/// Help copy shown under the inspector's editable fields. Each line names
+/// what the field is for and the limit the engine will enforce, so the
+/// requirement is visible before the first rejected edit.
+const FIELD_HELP_VALUE: &str = "Free text: a name or value, like R1 or 10k. It updates the symbol or package immediately when Apply is pressed.";
+const FIELD_HELP_POSITION: &str =
+    "Absolute millimetres from the design origin; Apply moves just this symbol or package.";
+const FIELD_HELP_BOARD: &str =
+    "Board outline size in millimetres; both values must be larger than zero.";
+const FIELD_HELP_CUTOUT: &str =
+    "Radius of the circle the cutout tool places; the whole circle must stay inside the board.";
+
+fn field_help(ui: &mut egui::Ui, text: &str, muted: egui::Color32) {
+    ui.label(egui::RichText::new(text).small().color(muted).weak());
+}
+
+/// The complete input reference: every key binding the app installs, plus
+/// the canvas mouse gestures, with where each one applies. The overlay and
+/// the tests read this one table, so the list can never claim a key the
+/// handler does not install.
+fn shortcut_rows() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        ("Ctrl+Z", "Undo the last action", "anywhere"),
+        ("Ctrl+Shift+Z", "Redo an undone action", "anywhere"),
+        ("Ctrl+Y", "Redo an undone action", "anywhere"),
+        ("Ctrl+S", "Save the design to its file", "anywhere"),
+        ("Ctrl+K", "Open the command palette", "anywhere"),
+        (
+            "Up/Down",
+            "Move the highlight through the command list",
+            "command palette",
+        ),
+        (
+            "Enter",
+            "Load the highlighted command, then run it from the parameters box",
+            "command palette",
+        ),
+        ("?", "Show or hide this shortcut list", "anywhere"),
+        ("A", "Open the symbol palette", "schematic tab"),
+        (
+            "W",
+            "Wire tool: click two pins to connect them",
+            "schematic tab",
+        ),
+        (
+            "X",
+            "Route tool: click two pads to start a track",
+            "pcb tab",
+        ),
+        (
+            "M",
+            "Move tool: drop the selection at the cursor",
+            "anywhere",
+        ),
+        (
+            "R",
+            "Rotate the hovered or selected object by 90 degrees",
+            "anywhere",
+        ),
+        (
+            "E",
+            "Load the hovered or selected object into the inspector",
+            "anywhere",
+        ),
+        ("Home", "Zoom the view so the whole design fits", "anywhere"),
+        ("Delete", "Delete the selected object", "anywhere"),
+        (
+            "Esc",
+            "Return to the select tool and close open palettes",
+            "anywhere",
+        ),
+        ("Middle-drag", "Pan the view", "canvas"),
+        ("Scroll", "Zoom the view", "canvas"),
+    ]
+}
+
+/// What the mouse and keys will do next for the active tool. The strip is
+/// rendered under the toolbar so the next action is always visible instead
+/// of being something the user has to remember.
+fn tool_hint(tool: &Tool) -> String {
+    let common = " · middle-drag: pan · scroll: zoom · Esc: back to select";
+    match tool {
+        Tool::Select => format!("LMB: select an object · drag: move the selected object{common}"),
+        Tool::Place(_) => format!("LMB: place the symbol at the cursor{common}"),
+        Tool::LibraryPlace(..) | Tool::CustomPlace(..) => {
+            format!("LMB: place the symbol package at the cursor{common}")
+        }
+        Tool::Wire(None) => format!("LMB: pick the first pin of the new wire{common}"),
+        Tool::Wire(Some(_)) => {
+            format!("LMB: pick the second pin to complete the wire{common}")
+        }
+        Tool::Route(None) => format!("LMB: pick the first pad to start the track{common}"),
+        Tool::Route(Some(_)) => {
+            format!("LMB: pick the second pad to complete the track{common}")
+        }
+        Tool::Move => format!("LMB: drop the selected object at the cursor{common}"),
+        Tool::Cutout => format!("LMB: place a circular cutout at the cursor{common}"),
+    }
+}
+
+/// Move the palette highlight by `delta` rows, wrapping around the ends so
+/// the list behaves like a ring; an empty list always lands on row 0 and a
+/// stale index (after the filter shrinks the list) is pulled back in range.
+fn step_index(current: usize, count: usize, delta: isize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let base = current.min(count - 1) as isize;
+    (base + delta).rem_euclid(count as isize) as usize
+}
+
+/// Case-insensitive subsequence match: every character of the query must
+/// appear, in order, somewhere in the text.
+fn fuzzy_match(query: &str, text: &str) -> bool {
+    let mut text = text.chars();
+    query
+        .chars()
+        .all(|q| text.any(|t| t.eq_ignore_ascii_case(&q)))
+}
+
+/// A starter parameters object for a command: every required parameter gets
+/// a plausible sample value taken from its own schema (the schema default,
+/// the first listed option, the schema minimum, or a neutral stand-in), so
+/// picking a command in the palette immediately shows the shape its
+/// parameters must have; optional parameters are left out to be added.
+fn params_template(spec: &pcbcraft_engine::CommandSpec) -> String {
+    template_object(&spec.input_schema).to_string()
+}
+
+/// One line per required parameter of a command, read from the command's own
+/// schema: the parameter name, the shape it accepts (type, bounds, options)
+/// and the schema's own description. The palette shows this under the search
+/// row so the parameters are explained before a command is ever refused.
+fn param_help(spec: &pcbcraft_engine::CommandSpec) -> Vec<String> {
+    let schema = &spec.input_schema;
+    let properties = schema.get("properties").cloned().unwrap_or(Value::Null);
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .filter_map(|key| {
+                    properties.get(key).map(|field| {
+                        let mut line = format!("{key} ({}):", type_note(field));
+                        match field.get("description").and_then(Value::as_str) {
+                            Some(text) => line.push_str(&format!(" {text}")),
+                            None => line.push_str(" required"),
+                        }
+                        line
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Plain-words shape of one schema field: the listed options when there are
+/// any, otherwise the type with the bounds the schema states.
+fn type_note(field: &Value) -> String {
+    if let Some(options) = field.get("enum").and_then(Value::as_array) {
+        let names: Vec<String> = options
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        if !names.is_empty() {
+            return format!("one of {}", names.join(" or "));
+        }
+    }
+    match field.get("type").and_then(Value::as_str) {
+        Some("integer") | Some("number") => {
+            let min = field
+                .get("minimum")
+                .or_else(|| field.get("exclusiveMinimum"))
+                .and_then(Value::as_f64);
+            let max = field.get("maximum").and_then(Value::as_f64);
+            match (min, max) {
+                (Some(lo), Some(hi)) => format!("number {lo} to {hi}"),
+                (Some(lo), None) => format!("number from {lo}"),
+                (None, Some(hi)) => format!("number up to {hi}"),
+                (None, None) => "number".into(),
+            }
+        }
+        Some("string") => "text".into(),
+        Some("boolean") => "true or false".into(),
+        Some("array") => "list".into(),
+        Some("object") => "object".into(),
+        _ => "value".into(),
+    }
+}
+
+fn template_object(schema: &Value) -> Value {
+    let properties = schema.get("properties").cloned().unwrap_or(Value::Null);
+    let keys: Vec<String> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut object = serde_json::Map::new();
+    for key in keys {
+        if let Some(field) = properties.get(&key) {
+            object.insert(key, sample_value(field));
+        }
+    }
+    Value::Object(object)
+}
+
+fn sample_value(schema: &Value) -> Value {
+    if let Some(default) = schema.get("default") {
+        return default.clone();
+    }
+    if let Some(options) = schema.get("enum").and_then(Value::as_array)
+        && let Some(first) = options.first()
+    {
+        return first.clone();
+    }
+    match schema.get("type").and_then(Value::as_str) {
+        Some("integer") => schema.get("minimum").cloned().unwrap_or(json!(1)),
+        Some("number") => schema.get("minimum").cloned().unwrap_or(json!(0.0)),
+        Some("boolean") => json!(false),
+        Some("string") => json!(""),
+        Some("array") => {
+            let count = schema
+                .get("minItems")
+                .and_then(Value::as_u64)
+                .unwrap_or(2)
+                .clamp(2, 8);
+            let item = schema
+                .get("items")
+                .map(sample_value)
+                .unwrap_or(json!([0.0, 0.0]));
+            Value::Array(vec![item; count as usize])
+        }
+        _ => {
+            if schema.get("properties").is_some() {
+                template_object(schema)
+            } else {
+                json!("")
+            }
+        }
+    }
+}
+
+/// Hover text for a control that runs an engine command: the command
+/// registry description is the single source of truth for what the control
+/// does, so the UI explanation and the command documentation never drift.
+fn command_tip(id: &str) -> String {
+    pcbcraft_engine::commands()
+        .into_iter()
+        .find(|spec| spec.id == id)
+        .map_or_else(
+            || "This control runs an engine command.".into(),
+            |spec| spec.description.to_string(),
+        )
+}
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Tab {
     Schematic,
     Pcb,
     Libraries,
     Checks,
 }
+/// What the board canvas draws at each pad centre.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+enum PadLabels {
+    /// The pad's own number, the default assembly view.
+    #[default]
+    Number,
+    /// The net the pad sits on, blank for unconnected pads.
+    Net,
+    /// Nothing, for a clean copper picture.
+    Off,
+}
+impl PadLabels {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Number => "Pads: number",
+            Self::Net => "Pads: net",
+            Self::Off => "Pads: off",
+        }
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 struct Preferences {
     dark: bool,
     grid: bool,
     accent: [u8; 3],
+    pad_labels: PadLabels,
+    #[serde(default)]
+    hidden_layers: Vec<String>,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -28,10 +328,12 @@ impl Default for Preferences {
             dark: true,
             grid: true,
             accent: [91, 224, 188],
+            pad_labels: PadLabels::Number,
+            hidden_layers: Vec::new(),
         }
     }
 }
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum Tool {
     Select,
     Place(String),
@@ -70,11 +372,21 @@ pub struct App {
     tab: Tab,
     tool: Tool,
     selected: Option<Id>,
+    highlight_net: Option<Id>,
     selected_unit: u32,
     route_layer: pcbcraft_doc::Layer,
     preferences: Preferences,
+    recent_designs: Vec<String>,
+    home_open: bool,
+    home_path_focus: bool,
+    left_tab: usize,
+    net_draft: Option<(pcbcraft_doc::Id, String)>,
     appearance: bool,
     palette: bool,
+    part_search: String,
+    svg_path: String,
+    part_search_focus: bool,
+    needs_fit: bool,
     schematic: Camera,
     pcb: Camera,
     drag: Option<(Id, Point)>,
@@ -92,10 +404,97 @@ pub struct App {
     command: String,
     params: String,
     command_open: bool,
+    command_query: String,
+    shortcuts_open: bool,
+    command_focus: bool,
+    command_index: usize,
+    command_scroll: bool,
     capture: Option<String>,
     frames: u32,
     library: library::Browser,
 }
+/// Plain-language facts about a selected board or schematic object that is not
+/// a component, so the properties panel can describe tracks, vias, zones,
+/// labels, wires and graphics instead of showing a bare id.
+fn object_detail_rows(project: &Project, id: Id) -> Vec<(String, String)> {
+    let net = |id: Id| project.net_name(id).to_string();
+    let layer = |value: &pcbcraft_doc::Layer| {
+        serde_json::to_value(value)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default()
+    };
+    let mut rows: Vec<(String, String)> = Vec::new();
+    if let Some(t) = project.board.tracks.iter().find(|t| t.id == id) {
+        rows.push(("Net".into(), net(t.net)));
+        rows.push(("Layer".into(), layer(&t.layer)));
+        rows.push(("Width".into(), format!("{:.3} mm", t.width)));
+        rows.push((
+            "From".into(),
+            format!("{:.2}, {:.2} mm", t.start.x, t.start.y),
+        ));
+        rows.push(("To".into(), format!("{:.2}, {:.2} mm", t.end.x, t.end.y)));
+        if t.arc.is_some() {
+            rows.push(("Shape".into(), "curved through a midpoint".into()));
+        }
+    } else if let Some(v) = project.board.vias.iter().find(|v| v.id == id) {
+        rows.push(("Net".into(), net(v.net)));
+        rows.push(("Copper".into(), format!("{:.2} mm", v.diameter)));
+        rows.push(("Drill".into(), format!("{:.2} mm", v.drill)));
+        rows.push((
+            "Position".into(),
+            format!("{:.2}, {:.2} mm", v.position.x, v.position.y),
+        ));
+    } else if let Some(z) = project.board.zones.iter().find(|z| z.id == id) {
+        rows.push(("Net".into(), net(z.net)));
+        rows.push(("Layer".into(), layer(&z.layer)));
+        rows.push((
+            "Copper".into(),
+            if z.filled {
+                "poured".into()
+            } else {
+                "outline only".into()
+            },
+        ));
+        rows.push(("Outline".into(), format!("{} vertices", z.outline.len())));
+        if !z.cutouts.is_empty() {
+            rows.push(("Cutouts".into(), format!("{}", z.cutouts.len())));
+        }
+    } else if let Some(l) = project.labels.iter().find(|l| l.id == id) {
+        rows.push(("Kind".into(), l.kind.clone()));
+        rows.push(("Net".into(), net(l.net)));
+        rows.push((
+            "Position".into(),
+            format!("{:.2}, {:.2} mm", l.position.x, l.position.y),
+        ));
+    } else if let Some(w) = project.drawn_wires.iter().find(|w| w.id == id) {
+        rows.push((
+            "Net".into(),
+            w.net.map(net).unwrap_or_else(|| "unbound".into()),
+        ));
+        rows.push(("Points".into(), format!("{}", w.points.len())));
+    } else if let Some(t) = project.board.texts.iter().find(|t| t.id == id) {
+        rows.push(("Text".into(), t.text.clone()));
+        rows.push(("Size".into(), format!("{:.2} mm", t.size)));
+        rows.push(("Layer".into(), layer(&t.layer)));
+        rows.push(("Angle".into(), format!("{:.0} degrees", t.rotation)));
+    } else if let Some(g) = project.graphics.iter().find(|g| g.id == id) {
+        rows.push(("Shape".into(), g.shape.clone()));
+        rows.push(("Layer".into(), g.layer.clone()));
+        if !g.text.is_empty() {
+            rows.push(("Text".into(), g.text.clone()));
+        }
+        rows.push(("Stroke".into(), format!("{:.3} mm", g.width)));
+        rows.push(("Points".into(), format!("{}", g.points.len())));
+    } else if let Some(gr) = project.graphic_groups.iter().find(|gr| gr.id == id) {
+        rows.push((
+            "Group".into(),
+            format!("{} graphics move as one", gr.graphics.len()),
+        ));
+    }
+    rows
+}
+
 impl App {
     pub fn with_project_path(mut self, path: Option<String>) -> Self {
         if let Some(path) = path {
@@ -130,15 +529,9 @@ impl App {
         {
             let _ = current.replace(project);
         }
+        let show_home = capture.is_none();
         let mut app = Self::create(session, preferences, capture, tab);
-        if !app.project.components.is_empty() {
-            let initial = app.tab;
-            app.tab = Tab::Schematic;
-            app.fit();
-            app.tab = Tab::Pcb;
-            app.fit();
-            app.tab = initial;
-        }
+        app.home_open = show_home && app.project.components.is_empty();
         app
     }
     fn create(
@@ -172,11 +565,21 @@ impl App {
             },
             tool: Tool::Select,
             selected: None,
+            highlight_net: None,
             selected_unit: 1,
             route_layer: pcbcraft_doc::Layer::Front,
             preferences,
+            recent_designs: pcbcraft_engine::recents::load_recent_paths(),
+            home_open: false,
+            home_path_focus: false,
+            left_tab: 0,
+            net_draft: None,
             appearance: false,
             palette: false,
+            part_search: String::new(),
+            svg_path: String::new(),
+            part_search_focus: false,
+            needs_fit: true,
             schematic: Camera {
                 center: Point::new(40.0, 24.0),
                 zoom: 11.0,
@@ -200,6 +603,11 @@ impl App {
             command: "component.add".into(),
             params: "{\"kind\":\"resistor\",\"position\":{\"x\":30,\"y\":20}}".into(),
             command_open: false,
+            command_query: String::new(),
+            shortcuts_open: false,
+            command_focus: false,
+            command_index: 0,
+            command_scroll: false,
             capture,
             frames: 0,
             library,
@@ -228,6 +636,16 @@ impl App {
             self.load_properties();
         }
     }
+    fn execute_palette_params(&mut self) {
+        match serde_json::from_str(&self.params.clone()) {
+            Ok(v) => {
+                let command = self.command.clone();
+                self.run(&command, v);
+            }
+            Err(e) => self.message = e.to_string(),
+        }
+    }
+
     fn run(&mut self, command: &str, params: Value) {
         let result = self
             .session
@@ -275,10 +693,16 @@ impl App {
         };
         self.refresh();
         if success && (name == "save" || name == "open") {
+            pcbcraft_engine::recents::record_recent_path(&self.path);
+            self.recent_designs = pcbcraft_engine::recents::load_recent_paths();
             self.saved_revision = Some(self.revision);
+        }
+        if success && (name == "open" || name == "new_design" || name == "sample_design") {
+            self.needs_fit = true;
         }
         success
     }
+
     fn accent(&self) -> Color32 {
         if !self.preferences.dark && self.preferences.accent == [91, 224, 188] {
             return Color32::from_rgb(18, 135, 110);
@@ -355,9 +779,68 @@ impl App {
             self.selected = Some(f.component);
         }
         self.tab = tab;
+        self.needs_fit = true;
         self.tool = Tool::Select;
         self.drag = None;
         self.load_properties();
+    }
+    fn layer_shown(&self, name: &str) -> bool {
+        !self
+            .preferences
+            .hidden_layers
+            .iter()
+            .any(|hidden| hidden == name)
+    }
+    fn layers_tab(&mut self, ui: &mut egui::Ui) {
+        let rows: &[&str] = match self.tab {
+            Tab::Schematic => &["Grid", "Symbols", "Wires", "Net labels", "Graphics"],
+            Tab::Pcb => &[
+                "Grid",
+                "Top copper",
+                "Bottom copper",
+                "Pads",
+                "Vias",
+                "Copper zones",
+                "Cutouts",
+                "Package artwork",
+            ],
+            _ => &[],
+        };
+        if rows.is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    "Switch to the schematic or the board to show or hide parts of the drawing.",
+                )
+                .small()
+                .color(self.muted()),
+            );
+            ui.add_space(20.0);
+            self.board_summary(ui);
+            return;
+        }
+        ui.label(
+            egui::RichText::new("WHAT THE DRAWING SHOWS")
+                .size(10.0)
+                .color(self.muted()),
+        );
+        for name in rows {
+            let mut shown = self.layer_shown(name);
+            if ui
+                .checkbox(&mut shown, *name)
+                .on_hover_text(format!(
+                    "Show or hide {name} on the drawing. Hiding changes only the view, never the design."
+                ))
+                .clicked()
+            {
+                if shown {
+                    self.preferences.hidden_layers.retain(|hidden| hidden != name);
+                } else {
+                    self.preferences.hidden_layers.push((*name).to_string());
+                }
+            }
+        }
+        ui.add_space(20.0);
+        self.board_summary(ui);
     }
     fn rotate(&mut self) {
         if let Some(id) = self.selected {
@@ -380,6 +863,9 @@ impl App {
         }
         ctx.input(|i| {
             if i.modifiers.command {
+                if i.key_pressed(egui::Key::F) {
+                    self.needs_fit = true;
+                }
                 if i.key_pressed(egui::Key::Z) {
                     self.tool_call(if i.modifiers.shift { "redo" } else { "undo" }, json!({}));
                 }
@@ -391,6 +877,8 @@ impl App {
                 }
                 if i.key_pressed(egui::Key::K) {
                     self.command_open = !self.command_open;
+                    self.command_focus = self.command_open;
+                    self.command_index = 0;
                 }
                 return;
             }
@@ -417,12 +905,16 @@ impl App {
                 self.load_properties();
             }
             if i.key_pressed(egui::Key::Home) {
-                self.fit();
+                self.needs_fit = true;
             }
             if i.key_pressed(egui::Key::Escape) {
                 self.tool = Tool::Select;
                 self.drag = None;
                 self.palette = false;
+                self.shortcuts_open = false;
+            }
+            if i.key_pressed(egui::Key::Slash) {
+                self.shortcuts_open = !self.shortcuts_open;
             }
             if i.key_pressed(egui::Key::Delete)
                 && let Some(id) = self.selected
@@ -469,40 +961,32 @@ impl App {
         });
     }
     fn header(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("header").exact_size(118.0).show(ui, |ui| {
+        egui::Panel::top("header").exact_size(100.0).show(ui, |ui| {
             ui.add_space(7.0);
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
-                ui.label(
-                    egui::RichText::new("PCBCraft")
-                        .size(22.0)
-                        .strong()
-                        .color(self.accent()),
+                let brand = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("PCBCraft")
+                            .size(20.0)
+                            .strong()
+                            .color(self.accent()),
+                    )
+                    .sense(egui::Sense::click()),
                 );
-                ui.label(egui::RichText::new("/").color(self.muted()));
-                ui.label(egui::RichText::new(&self.project.name).size(16.0));
-                if self.saved_revision != Some(self.revision) {
-                    ui.label(egui::RichText::new("*").color(self.accent()));
+                if brand
+                    .on_hover_text("Back to the start screen, where you open or begin a design.")
+                    .clicked()
+                {
+                    self.home_open = true;
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Appearance").clicked() {
-                        self.appearance = !self.appearance;
-                    }
-                    if ui.button("Save  Ctrl+S").clicked() {
-                        self.tool_call("save", json!({"path":self.path}));
-                    }
-                    if ui.button("Redo").clicked() {
-                        self.tool_call("redo", json!({}));
-                    }
-                    if ui.button("Undo").clicked() {
-                        self.tool_call("undo", json!({}));
-                    }
-                    ui.label(
-                        egui::RichText::new("MCP FIRST")
-                            .size(10.0)
-                            .color(self.muted()),
-                    );
-                });
+                if self.library.editor.mode == 0 {
+                    ui.separator();
+                    self.file_menu(ui);
+                    self.edit_menu(ui);
+                    self.settings_menu(ui);
+                    self.help_menu(ui);
+                }
             });
             ui.add_space(5.0);
             ui.horizontal(|ui| {
@@ -550,112 +1034,353 @@ impl App {
             });
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
-                if ui
-                    .selectable_label(matches!(self.tool, Tool::Select), "Select  Esc")
-                    .clicked()
-                {
-                    self.tool = Tool::Select;
-                }
-                match self.tab {
-                    Tab::Schematic => {
-                        if ui.button("Add symbol  A").clicked() {
-                            self.palette = !self.palette;
-                        }
-                        if ui
-                            .selectable_label(matches!(self.tool, Tool::Wire(_)), "Wire  W")
-                            .clicked()
-                        {
-                            self.tool = Tool::Wire(None);
-                        }
-                        if ui.button("Sync to PCB >").clicked() {
-                            self.run("board.sync", json!({}));
-                            self.change_tab(Tab::Pcb);
-                        }
-                    }
-                    Tab::Pcb => {
-                        egui::ComboBox::from_id_salt("route-layer")
-                            .selected_text(self.route_layer.name())
-                            .width(64.0)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.route_layer,
-                                    pcbcraft_doc::Layer::Front,
-                                    "F.Cu",
-                                );
-                                ui.selectable_value(
-                                    &mut self.route_layer,
-                                    pcbcraft_doc::Layer::Back,
-                                    "B.Cu",
-                                );
-                            });
-                        if ui
-                            .selectable_label(matches!(self.tool, Tool::Route(_)), "Route  X")
-                            .clicked()
-                        {
-                            self.tool = Tool::Route(None);
-                        }
-                        if ui.button("Sync schematic").clicked() {
-                            self.run("board.sync", json!({}));
-                        }
-                        if ui
-                            .selectable_label(matches!(self.tool, Tool::Cutout), "Circular cutout")
-                            .clicked()
-                        {
-                            self.tool = Tool::Cutout;
-                        }
-                    }
-                    _ => {}
-                }
-                if ui.button("Move  M").clicked() {
-                    self.tool = Tool::Move;
-                }
-                if ui.button("Rotate  R").clicked() {
-                    self.rotate();
-                }
-                if ui.button("Fit").clicked() {
-                    self.fit();
-                }
-                if ui.button("Commands  Ctrl+K").clicked() {
-                    self.command_open = !self.command_open;
-                }
+                ui.label(
+                    egui::RichText::new(tool_hint(&self.tool))
+                        .small()
+                        .color(self.muted()),
+                );
             });
         });
     }
-    fn fit(&mut self) {
-        if self.tab == Tab::Pcb {
-            self.pcb.center = Point::new(
-                self.project.board.width / 2.0,
-                self.project.board.height / 2.0,
-            );
-            self.pcb.zoom = (700.0 / self.project.board.width.max(self.project.board.height))
-                .clamp(1.0, 60.0) as f32;
-        } else {
-            let (mut xmin, mut ymin, mut xmax, mut ymax) = (
-                f64::INFINITY,
-                f64::INFINITY,
-                f64::NEG_INFINITY,
-                f64::NEG_INFINITY,
-            );
-            for c in self
-                .project
-                .components
-                .iter()
-                .flat_map(|c| c.schematic_views())
-            {
-                for point in c.drawing_points() {
-                    let point = c.position.offset(point.rotate(-c.rotation));
-                    xmin = xmin.min(point.x - 4.0);
-                    xmax = xmax.max(point.x + 4.0);
-                    ymin = ymin.min(point.y - 4.0);
-                    ymax = ymax.max(point.y + 4.0);
-                }
-            }
-            if xmin.is_finite() {
-                self.schematic.center = Point::new((xmin + xmax) / 2.0, (ymin + ymax) / 2.0);
-                self.schematic.zoom = (650.0 / (xmax - xmin).max((ymax - ymin) * 1.5).max(10.0))
-                    .clamp(2.0, 35.0) as f32;
-            }
+    fn start_home(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(self.surface()))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(36.0);
+                            ui.label(
+                                egui::RichText::new("Welcome to PCBCraft")
+                                    .size(30.0)
+                                    .strong()
+                                    .color(self.accent()),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "Draw a circuit, place the parts, and finish with a board ready to order.",
+                                )
+                                .size(14.0)
+                                .color(self.muted()),
+                            );
+                            ui.add_space(24.0);
+                            if ui
+                                .add_sized(
+                                    [300.0, 64.0],
+                                    egui::Button::new(
+                                        (
+                                            egui::RichText::new("New design")
+                                                .size(16.0)
+                                                .strong(),
+                                            egui::RichText::new("Begin with a blank page.")
+                                                .small()
+                                                .color(self.muted()),
+                                        ),
+                                    ),
+                                )
+                                .on_hover_text("Start a fresh empty design.")
+                                .clicked()
+                            {
+                                self.tool_call("new_design", json!({}));
+                                self.select(None);
+                                self.home_open = false;
+                            }
+                            ui.add_space(6.0);
+                            if ui
+                                .add_sized(
+                                    [300.0, 64.0],
+                                    egui::Button::new(
+                                        (
+                                            egui::RichText::new("Worked example")
+                                                .size(16.0)
+                                                .strong(),
+                                            egui::RichText::new(
+                                                "A small battery, resistor and LED to explore.",
+                                            )
+                                            .small()
+                                            .color(self.muted()),
+                                        ),
+                                    ),
+                                )
+                                .on_hover_text(
+                                    "Start from a small worked example: a battery, resistor and LED.",
+                                )
+                                .clicked()
+                            {
+                                self.tool_call("sample_design", json!({}));
+                                self.home_open = false;
+                            }
+                            ui.add_space(6.0);
+                            if ui
+                                .add_sized(
+                                    [300.0, 64.0],
+                                    egui::Button::new(
+                                        (
+                                            egui::RichText::new("Open a design file…")
+                                                .size(16.0)
+                                                .strong(),
+                                            egui::RichText::new(
+                                                "Type a path, or pick one from the list below.",
+                                            )
+                                            .small()
+                                            .color(self.muted()),
+                                        ),
+                                    ),
+                                )
+                                .on_hover_text(
+                                    "Load a saved design file from the path beside this button.",
+                                )
+                                .clicked()
+                            {
+                                self.home_path_focus = true;
+                            }
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                let path_box = ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut self.path)
+                                            .hint_text("design file path")
+                                            .desired_width(240.0),
+                                    )
+                                    .on_hover_text(
+                                        "The file that Open on this page, and in the File menu, uses.",
+                                    );
+                                if self.home_path_focus {
+                                    path_box.request_focus();
+                                    self.home_path_focus = false;
+                                }
+                                if ui
+                                    .button("Open")
+                                    .on_hover_text(
+                                        "Load the design file named in the box beside this button.",
+                                    )
+                                    .clicked()
+                                {
+                                    self.tool_call("open", json!({"path": self.path}));
+                                    if self.message.starts_with("open") {
+                                        self.home_open = false;
+                                    }
+                                }
+                            });
+                            if !self.recent_designs.is_empty() {
+                                ui.add_space(18.0);
+                                ui.label(
+                                    egui::RichText::new("Open one you worked on recently")
+                                        .size(14.0)
+                                        .strong(),
+                                );
+                                for design in self.recent_designs.clone() {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new(&design).small(),
+                                            )
+                                            .min_size(egui::vec2(300.0, 28.0)),
+                                        )
+                                        .on_hover_text(
+                                            "Open this design again where you left off.",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.path = design;
+                                        self.tool_call("open", json!({"path": self.path}));
+                                        if self.message.starts_with("open") {
+                                            self.home_open = false;
+                                        }
+                                    }
+                                }
+                            }
+                            ui.add_space(14.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Press Escape, or click PCBCraft in the corner, to return here any time.",
+                                )
+                                .small()
+                                .color(self.muted()),
+                            );
+                            ui.add_space(24.0);
+                        });
+                    });
+            });
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.home_open = false;
         }
+    }
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("File", |ui| {
+            if ui
+                .button("New")
+                .on_hover_text("Start a fresh empty design.")
+                .clicked()
+            {
+                self.tool_call("new_design", json!({}));
+                self.select(None);
+            }
+            if ui
+                .button("Open")
+                .on_hover_text(
+                    "Choose a design to open; your recent designs are listed on the screen that appears.",
+                )
+                .clicked()
+            {
+                self.home_open = true;
+            }
+            if ui
+                .button("Save")
+                .on_hover_text("Write the design to its file on disk. (Ctrl+S works too.)")
+                .clicked()
+            {
+                self.tool_call("save", json!({"path":self.path}));
+            }
+            ui.separator();
+            if ui
+                .button("Export interchange board")
+                .on_hover_text("Write the board out so other design tools can open it.")
+                .clicked()
+            {
+                let path = std::path::Path::new(&self.path)
+                    .with_extension("kicad_pcb")
+                    .to_string_lossy()
+                    .into_owned();
+                self.tool_call("export", json!({"path":path,"format":"kicad_pcb"}));
+            }
+            if ui
+                .button("Copy view picture to clipboard")
+                .on_hover_text("Copy a PNG snapshot of the current view, the same picture a plotter would draw, so it can be pasted into a document.")
+                .clicked()
+            {
+                let ctx = ui.ctx().clone();
+                self.copy_plot_to_clipboard(&ctx);
+            }
+        })
+        .response
+        .on_hover_text("Start, open, save, export and share this design.");
+    }
+    fn edit_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Edit", |ui| {
+            if ui
+                .button("Undo")
+                .on_hover_text("Step back one action; every edit here is one undoable step.")
+                .clicked()
+            {
+                self.tool_call("undo", json!({}));
+            }
+            if ui
+                .button("Redo")
+                .on_hover_text("Step forward to the action you undid.")
+                .clicked()
+            {
+                self.tool_call("redo", json!({}));
+            }
+            ui.separator();
+            if ui
+                .button("Update board from schematic")
+                .on_hover_text(
+                    "Copy every symbol, wire and net onto the board, then show the board.",
+                )
+                .clicked()
+            {
+                self.run("board.sync", json!({}));
+                self.change_tab(Tab::Pcb);
+            }
+        })
+        .response
+        .on_hover_text("Step back and forward through every edit.");
+    }
+    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Settings", |ui| {
+            if ui
+                .button("Appearance…")
+                .on_hover_text("Pick the theme, accent colour and what sits on each pad.")
+                .clicked()
+            {
+                self.appearance = !self.appearance;
+            }
+            if ui
+                .button(if self.preferences.dark {
+                    "Switch to the light theme"
+                } else {
+                    "Switch to the dark theme"
+                })
+                .on_hover_text("Change between the dark and light look.")
+                .clicked()
+            {
+                self.preferences.dark = !self.preferences.dark;
+            }
+            if ui
+                .button(if self.preferences.grid {
+                    "Hide the grid"
+                } else {
+                    "Show the grid"
+                })
+                .on_hover_text("Show or hide the placement grid in the work area.")
+                .clicked()
+            {
+                self.preferences.grid = !self.preferences.grid;
+            }
+            ui.menu_button("Route on", |ui| {
+                ui.selectable_value(&mut self.route_layer, pcbcraft_doc::Layer::Front, "Top");
+                ui.selectable_value(&mut self.route_layer, pcbcraft_doc::Layer::Back, "Bottom");
+            })
+            .response
+            .on_hover_text("Choose which copper layer new tracks are drawn on.");
+            ui.menu_button("Pad labels", |ui| {
+                ui.selectable_value(
+                    &mut self.preferences.pad_labels,
+                    PadLabels::Number,
+                    PadLabels::Number.name(),
+                );
+                ui.selectable_value(
+                    &mut self.preferences.pad_labels,
+                    PadLabels::Net,
+                    PadLabels::Net.name(),
+                );
+                ui.selectable_value(
+                    &mut self.preferences.pad_labels,
+                    PadLabels::Off,
+                    PadLabels::Off.name(),
+                );
+            })
+            .response
+            .on_hover_text(
+                "Pick what sits at each pad centre on the board: its number, its net, or nothing.",
+            );
+            ui.separator();
+            if ui
+                .button("Library sources…")
+                .on_hover_text("Manage the folders that feed the component list.")
+                .clicked()
+            {
+                self.change_tab(Tab::Libraries);
+            }
+        })
+        .response
+        .on_hover_text("Theme, grid and library folders.");
+    }
+    fn help_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Help", |ui| {
+            if ui
+                .button("Keyboard shortcuts")
+                .on_hover_text("Show every keyboard shortcut and mouse gesture in one list.")
+                .clicked()
+            {
+                self.shortcuts_open = !self.shortcuts_open;
+            }
+            if ui
+                .button("Commands  Ctrl+K")
+                .on_hover_text(
+                    "Search every command by name and run it, with its parameters explained.",
+                )
+                .clicked()
+            {
+                self.command_open = !self.command_open;
+                self.command_focus = self.command_open;
+                self.command_index = 0;
+            }
+        })
+        .response
+        .on_hover_text("Shortcuts list and the command search.");
     }
     fn browser(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("browser")
@@ -670,18 +1395,160 @@ impl App {
                 );
                 ui.label(egui::RichText::new(&self.project.name).strong());
                 ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.left_tab == 0, "Parts")
+                        .on_hover_text(
+                            "Everything placed in this design, and quick ways to add more.",
+                        )
+                        .clicked()
+                    {
+                        self.left_tab = 0;
+                    }
+                    if ui
+                        .selectable_label(self.left_tab == 1, "Nets")
+                        .on_hover_text(
+                            "Every wire connection by name: add one, rename one, or light one up.",
+                        )
+                        .clicked()
+                    {
+                        self.left_tab = 1;
+                    }
+                    if ui
+                        .selectable_label(self.left_tab == 2, "Layers")
+                        .on_hover_text(
+                            "Tick what the drawing shows: hide copper, silk or wires without touching the design.",
+                        )
+                        .clicked()
+                    {
+                        self.left_tab = 2;
+                    }
+                });
+                ui.separator();
+                if self.left_tab == 1 {
+                    self.nets_tab(ui);
+                    ui.add_space(20.0);
+                    self.board_summary(ui);
+                    return;
+                }
+                if self.left_tab == 2 {
+                    self.layers_tab(ui);
+                    return;
+                }
+                if ui
+                    .button("Add part")
+                    .on_hover_text("Search for a part to place on the schematic.")
+                    .clicked()
+                {
+                    self.palette = true;
+                    self.part_search_focus = true;
+                }
                 if self.palette {
-                    ui.label(egui::RichText::new("Add symbol").strong());
-                    if ui.button("Browse KiCad libraries →").clicked() {
+                    ui.label(egui::RichText::new("Add a part").strong());
+                    let query_box = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.part_search)
+                                .hint_text("Search parts by name")
+                                .desired_width(190.0),
+                        )
+                        .on_hover_text(
+                            "Type any part name; the list below narrows as you type.",
+                        );
+                    if self.part_search_focus {
+                        query_box.request_focus();
+                        self.part_search_focus = false;
+                    }
+                    if ui
+                        .button("Browse component libraries →")
+                        .on_hover_text(
+                            "Open the library panel to browse installed symbol and footprint collections.",
+                        )
+                        .clicked()
+                    {
                         self.change_tab(Tab::Libraries);
                         self.palette = false;
                     }
-                    for t in TEMPLATES {
-                        if ui.button(t.label).clicked() {
-                            self.change_tab(Tab::Schematic);
-                            self.tool = Tool::Place(t.kind.into());
-                            self.palette = false;
+                    let query = self.part_search.trim().to_lowercase();
+                    let built_in: Vec<(&str, &str)> = TEMPLATES
+                        .iter()
+                        .filter(|t| {
+                            query.is_empty()
+                                || t.label.to_lowercase().contains(&query)
+                                || t.kind.contains(query.as_str())
+                        })
+                        .map(|t| (t.kind, t.label))
+                        .collect();
+                    let saved: Vec<pcbcraft_library::SymbolDefinition> = self
+                        .project
+                        .library
+                        .symbols
+                        .iter()
+                        .filter(|d| {
+                            query.is_empty() || d.name.to_lowercase().contains(&query)
+                        })
+                        .cloned()
+                        .collect();
+                    if built_in.is_empty() && saved.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Nothing here matches \"{}\" yet.",
+                                self.part_search.trim()
+                            ))
+                            .small()
+                            .color(self.muted()),
+                        );
+                    }
+                    if !built_in.is_empty() {
+                        ui.label(
+                            egui::RichText::new("Common parts")
+                                .size(10.0)
+                                .color(self.muted()),
+                        );
+                        for (kind, label) in built_in {
+                            if ui
+                                .button(label)
+                                .on_hover_text(
+                                    "Pick this part; the next click on the schematic places it.",
+                                )
+                                .clicked()
+                            {
+                                self.change_tab(Tab::Schematic);
+                                self.tool = Tool::Place(kind.into());
+                                self.palette = false;
+                                self.part_search.clear();
+                            }
                         }
+                    }
+                    if !saved.is_empty() {
+                        ui.label(
+                            egui::RichText::new("From this project's library")
+                                .size(10.0)
+                                .color(self.muted()),
+                        );
+                        for definition in saved {
+                            if ui
+                                .button(&definition.name)
+                                .on_hover_text(
+                                    "Pick this saved part; the next click on the schematic places it.",
+                                )
+                                .clicked()
+                            {
+                                self.change_tab(Tab::Schematic);
+                                self.tool = Tool::CustomPlace(
+                                    definition.name.clone(),
+                                    Box::new(definition),
+                                );
+                                self.palette = false;
+                                self.part_search.clear();
+                            }
+                        }
+                    }
+                    if ui
+                        .small_button("Close")
+                        .on_hover_text("Hide the part search without changing anything.")
+                        .clicked()
+                    {
+                        self.palette = false;
                     }
                     ui.separator();
                 }
@@ -713,32 +1580,11 @@ impl App {
                     }
                 }
                 if self.project.components.is_empty() {
-                    ui.label(
-                        egui::RichText::new("Press A to place your first symbol")
-                            .small()
-                            .color(self.muted()),
-                    );
-                }
-                ui.add_space(20.0);
-                ui.label(egui::RichText::new("NETS").size(10.0).color(self.muted()));
-                for net in &self.project.nets {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("*").color(self.accent()));
-                        ui.label(&net.name);
-                    });
+                    empty_state(ui, EMPTY_SYMBOLS, self.muted());
                 }
                 ui.add_space(20.0);
                 ui.label(egui::RichText::new("BOARD").size(10.0).color(self.muted()));
-                ui.label(format!(
-                    "{} × {} mm",
-                    self.project.board.width, self.project.board.height
-                ));
-                ui.label("2 copper layers · 1.6 mm");
-                ui.label(format!(
-                    "{} footprints · {} segments",
-                    self.project.board.footprints.len(),
-                    self.project.board.tracks.len()
-                ));
+                self.board_body(ui);
                 ui.add_space(20.0);
                 ui.separator();
                 ui.label(
@@ -752,6 +1598,122 @@ impl App {
                         .color(self.muted()),
                 );
             });
+    }
+    /// The Nets tab of the left dock: add, spotlight and rename connections.
+    fn nets_tab(&mut self, ui: &mut egui::Ui) {
+        if let Some(lit) = self.highlight_net
+            && !self.project.nets.iter().any(|n| n.id == lit)
+        {
+            self.highlight_net = None;
+        }
+        if self
+            .net_draft
+            .as_ref()
+            .is_some_and(|(id, _)| !self.project.nets.iter().any(|n| n.id == *id))
+        {
+            self.net_draft = None;
+        }
+        if ui
+            .button("New net")
+            .on_hover_text("Add a blank connection you can name and draw wires onto.")
+            .clicked()
+        {
+            let name = format!("Net {}", self.project.nets.len() + 1);
+            self.tool_call("net.create", json!({"name": name}));
+        }
+        ui.add_space(4.0);
+        for net in self.project.nets.clone() {
+            let lit = self.highlight_net == Some(net.id);
+            let renaming = self.net_draft.as_ref().is_some_and(|(id, _)| *id == net.id);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Label::new(if lit { "\u{25cf}" } else { "\u{25cb}" }).sense(
+                        egui::Sense::click(),
+                    ))
+                    .on_hover_text(
+                        "Spotlight this net: its copper, vias and pads light up on the board while everything else fades. Click again to clear the spotlight.",
+                    )
+                    .clicked()
+                {
+                    self.highlight_net = if lit { None } else { Some(net.id) };
+                }
+                if renaming {
+                    let Some((_, draft)) = self.net_draft.as_mut() else {
+                        return;
+                    };
+                    ui.add(
+                        egui::TextEdit::singleline(draft)
+                            .desired_width(120.0)
+                            .hint_text("net name"),
+                    )
+                    .on_hover_text("1 to 128 characters; every net needs its own name.");
+                    if ui
+                        .button("Use name")
+                        .on_hover_text("Keep this name for the connection.")
+                        .clicked()
+                    {
+                        let name = draft.clone();
+                        self.net_draft = None;
+                        self.tool_call("net.rename", json!({"id": net.id, "name": name}));
+                    }
+                    if ui
+                        .button("Cancel")
+                        .on_hover_text("Leave the name as it was.")
+                        .clicked()
+                    {
+                        self.net_draft = None;
+                    }
+                } else {
+                    if ui
+                        .selectable_label(lit, &net.name)
+                        .on_hover_text(
+                            "Spotlight this net: its copper, vias and pads light up on the board while everything else fades. Click again to clear the spotlight.",
+                        )
+                        .clicked()
+                    {
+                        self.highlight_net = if lit { None } else { Some(net.id) };
+                    }
+                    if ui
+                        .small_button("Rename")
+                        .on_hover_text("Type a new name for this connection.")
+                        .clicked()
+                    {
+                        self.net_draft = Some((net.id, net.name.clone()));
+                    }
+                }
+            });
+        }
+        if self.project.nets.is_empty() {
+            empty_state(ui, EMPTY_NETS, self.muted());
+        }
+        if let Some(lit) = self.highlight_net
+            && let Some(net) = self.project.nets.iter().find(|n| n.id == lit)
+        {
+            ui.label(
+                egui::RichText::new(format!("Spotlighting {} on the board.", net.name))
+                    .size(10.0)
+                    .color(self.accent()),
+            );
+        }
+    }
+    fn board_summary(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("BOARD").size(10.0).color(self.muted()));
+        self.board_body(ui);
+    }
+    fn board_body(&mut self, ui: &mut egui::Ui) {
+        ui.label(format!(
+            "{} × {} mm",
+            self.project.board.width, self.project.board.height
+        ));
+        ui.label("2 copper layers · 1.6 mm");
+        if self.project.board.footprints.is_empty() {
+            empty_state(ui, EMPTY_BOARD, self.muted());
+        }
+        ui.label(format!(
+            "{} footprints · {} segments",
+            self.project.board.footprints.len(),
+            self.project.board.tracks.len()
+        ));
     }
     fn inspector(&mut self, ui: &mut egui::Ui) {
         egui::Panel::right("inspector")
@@ -815,18 +1777,20 @@ impl App {
                         ui.add_space(10.0);
                         ui.label("Value");
                         ui.text_edit_singleline(&mut self.value);
-                        if ui.button("Apply value").clicked() {
+                        field_help(ui, FIELD_HELP_VALUE, self.muted());
+                        if ui.button("Apply value").on_hover_text(command_tip("component.value")).clicked() {
                             self.run("component.value", json!({"id":c.id,"value":self.value}));
                         }
                         ui.add_space(12.0);
                         ui.label("Position · mm");
+                        field_help(ui, FIELD_HELP_POSITION, self.muted());
                         ui.horizontal(|ui| {
                             ui.label("X");
                             ui.add(egui::DragValue::new(&mut self.x).speed(0.1));
                             ui.label("Y");
                             ui.add(egui::DragValue::new(&mut self.y).speed(0.1));
                         });
-                        if ui.button("Apply position").clicked() {
+                        if ui.button("Apply position").on_hover_text("Move the selected symbol or footprint to the position typed above.").clicked() {
                             let mut params = json!({"id":id,"position":{"x":self.x,"y":self.y}});
                             if self.project.component(id).is_some() {
                                 params["unit"] = json!(self.selected_unit);
@@ -840,7 +1804,7 @@ impl App {
                                 params,
                             );
                         }
-                        if ui.button("Rotate 90°  R").clicked() {
+                        if ui.button("Rotate 90°  R").on_hover_text(command_tip("component.rotate")).clicked() {
                             self.rotate();
                         }
                         ui.label(
@@ -855,7 +1819,7 @@ impl App {
                                     }
                                 }),
                         );
-                        if ui.button("Assign footprint in Libraries →").clicked() {
+                        if ui.button("Assign footprint in Libraries →").on_hover_text("Jump to the library panel to bind a footprint package to this component.").clicked() {
                             self.change_tab(Tab::Libraries);
                             self.library.kind = true;
                             self.library.pending = None;
@@ -878,9 +1842,15 @@ impl App {
                     } else {
                         ui.heading("Selected object");
                         ui.label(format!("Stable ID {id}"));
+                        for (name, value) in object_detail_rows(&self.project, id) {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(name).small().color(self.muted()));
+                                ui.label(value);
+                            });
+                        }
                     }
                     ui.add_space(10.0);
-                    if ui.button("Delete  Del").clicked() {
+                    if ui.button("Delete  Del").on_hover_text(command_tip("object.delete")).clicked() {
                         self.run("object.delete", json!({"id":id}));
                         self.select(None);
                     }
@@ -895,6 +1865,7 @@ impl App {
                         .size(10.0)
                         .color(self.muted()),
                 );
+                field_help(ui, FIELD_HELP_BOARD, self.muted());
                 ui.horizontal(|ui| {
                     ui.label("W");
                     ui.add(
@@ -911,10 +1882,65 @@ impl App {
                             .suffix(" mm"),
                     );
                 });
-                if ui.button("Apply board dimensions").clicked() {
+                if ui.button("Apply board dimensions").on_hover_text(command_tip("board.resize")).clicked() {
                     self.run(
                         "board.resize",
                         json!({"width":self.width,"height":self.height}),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("BOARD EDGE").size(10.0).color(self.muted()));
+                let corners = self.project.board.outline.as_ref().map_or(0, |o| o.len());
+                if corners >= 3 {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "A free shape with {corners} corners."
+                        ))
+                        .small()
+                        .color(self.muted()),
+                    );
+                    if ui
+                        .button("Back to a plain rectangle")
+                        .on_hover_text(
+                            "Trade the drawn board edge for the simple rectangle sized by W and H above.",
+                        )
+                        .clicked()
+                    {
+                        self.run("board.clear_outline", json!({}));
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.svg_path)
+                            .hint_text("drawing file path (.svg)")
+                            .desired_width(150.0),
+                    )
+                    .on_hover_text(
+                        "A vector drawing whose edge can become the board outline, or whose shapes can be laid onto the board as artwork.",
+                    );
+                });
+                if ui
+                    .button("Import drawing")
+                    .on_hover_text(
+                        "Lay the shapes from the drawing file onto the board as editable artwork.",
+                    )
+                    .clicked()
+                {
+                    self.run(
+                        "svg.import",
+                        json!({"path": self.svg_path.clone(), "use_outline": false}),
+                    );
+                }
+                if ui
+                    .button("Import as board edge")
+                    .on_hover_text(
+                        "Trace the closed shape in the drawing file into the board outline.",
+                    )
+                    .clicked()
+                {
+                    self.run(
+                        "svg.import",
+                        json!({"path": self.svg_path.clone(), "use_outline": true}),
                     );
                 }
                 ui.horizontal(|ui| {
@@ -925,6 +1951,7 @@ impl App {
                             .suffix(" mm"),
                     );
                 });
+                field_help(ui, FIELD_HELP_CUTOUT, self.muted());
                 ui.add_space(12.0);
                 ui.label(egui::RichText::new("CHECKS").size(10.0).color(self.muted()));
                 let erc = self
@@ -976,67 +2003,139 @@ impl App {
                 });
             });
         });
-        egui::Panel::bottom("files").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Project file");
-                ui.add(egui::TextEdit::singleline(&mut self.path).desired_width(260.0));
-                if ui.button("Open").clicked() {
-                    self.tool_call("open", json!({"path":self.path}));
-                }
-                if ui.button("Save").clicked() {
-                    self.tool_call("save", json!({"path":self.path}));
-                }
-                if ui.button("Export KiCad board").clicked() {
-                    let path = std::path::Path::new(&self.path)
-                        .with_extension("kicad_pcb")
-                        .to_string_lossy()
-                        .into_owned();
-                    self.tool_call("export", json!({"path":path,"format":"kicad_pcb"}));
-                }
-                if ui.button("LED example").clicked() {
-                    self.tool_call("sample_design", json!({}));
-                    self.fit();
-                }
-                if ui.button("New project").clicked() {
-                    self.tool_call("new_design", json!({}));
-                    self.select(None);
-                }
-            });
-        });
         if self.command_open {
             egui::Panel::bottom("commands")
                 .resizable(true)
-                .default_size(130.0)
+                .default_size(220.0)
                 .show(ui, |ui| {
+                    let query = self.command_query.clone();
+                    let matches: Vec<_> = pcbcraft_engine::commands()
+                        .into_iter()
+                        .filter(|spec| {
+                            query.is_empty()
+                                || fuzzy_match(&query, spec.id)
+                                || fuzzy_match(&query, spec.description)
+                        })
+                        .collect();
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("ENGINE COMMAND")
+                            egui::RichText::new("SEARCH")
                                 .small()
                                 .color(self.accent()),
                         );
-                        ui.text_edit_singleline(&mut self.command);
-                        ui.add(egui::TextEdit::singleline(&mut self.params).desired_width(500.0));
-                        if ui.button("Execute").clicked() {
-                            match serde_json::from_str(&self.params) {
-                                Ok(v) => self.run(&self.command.clone(), v),
-                                Err(e) => self.message = e.to_string(),
+                        let search = ui.add(
+                            egui::TextEdit::singleline(&mut self.command_query)
+                                .hint_text("filter command names and descriptions")
+                                .desired_width(300.0),
+                        );
+                        if self.command_focus {
+                            search.request_focus();
+                            self.command_focus = false;
+                        }
+                        ui.label(
+                            egui::RichText::new("PARAMETERS")
+                                .small()
+                                .color(self.accent()),
+                        );
+                        let fields = ui.add(
+                            egui::TextEdit::singleline(&mut self.params)
+                                .hint_text("parameters as JSON")
+                                .desired_width(380.0),
+                        );
+                        if ui
+                            .button("Execute")
+                            .on_hover_text(
+                                "Run the command with the parameters you typed; selecting a command fills a starter parameter set.",
+                            )
+                            .clicked()
+                        {
+                            self.execute_palette_params();
+                        }
+                        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if query != self.command_query {
+                            self.command_index = 0;
+                        }
+                        let stepped = ui.input(|i| {
+                            i.key_pressed(egui::Key::ArrowDown) as isize
+                                - i.key_pressed(egui::Key::ArrowUp) as isize
+                        });
+                        if stepped != 0 {
+                            self.command_index =
+                                step_index(self.command_index, matches.len(), stepped);
+                            self.command_scroll = true;
+                            if !search.has_focus() {
+                                search.request_focus();
                             }
                         }
+                        if enter
+                            && search.lost_focus()
+                            && let Some(spec) =
+                                matches.get(step_index(self.command_index, matches.len(), 0))
+                        {
+                            self.command = spec.id.into();
+                            self.params = params_template(spec);
+                            fields.request_focus();
+                        } else if enter && fields.lost_focus() {
+                            self.execute_palette_params();
+                        }
                     });
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} of {} commands match; click one to load it with a starter parameter set, or step the highlight with Up and Down and press Enter in the search box to load it",
+                            matches.len(),
+                            pcbcraft_engine::commands().len()
+                        ))
+                        .small()
+                        .color(self.muted()),
+                    );
                     egui::ScrollArea::vertical()
-                        .max_height(85.0)
+                        .max_height(180.0)
                         .show(ui, |ui| {
-                            for spec in pcbcraft_engine::commands() {
-                                if ui
-                                    .selectable_label(
-                                        self.command == spec.id,
-                                        format!("{}   {}", spec.id, spec.description),
-                                    )
-                                    .clicked()
-                                {
-                                    self.command = spec.id.into();
-                                    self.params = "{}".into();
+                            if let Some(spec) = pcbcraft_engine::commands()
+                                .into_iter()
+                                .find(|spec| spec.id == self.command)
+                            {
+                                for line in param_help(&spec) {
+                                    ui.label(
+                                        egui::RichText::new(line)
+                                            .small()
+                                            .color(self.muted()),
+                                    );
                                 }
+                            }
+                            for (row, spec) in matches.iter().enumerate() {
+                                let response = ui.selectable_label(
+                                    self.command == spec.id
+                                        || row == step_index(self.command_index, matches.len(), 0),
+                                    format!("{}   {}", spec.id, spec.description),
+                                );
+                                if row == self.command_index && self.command_scroll {
+                                    response.scroll_to_me(Some(egui::Align::Center));
+                                }
+                                if response.clicked() {
+                                    self.command = spec.id.into();
+                                    self.params = params_template(spec);
+                                    self.command_index = row;
+                                }
+                            }
+                            self.command_scroll = false;
+                        });
+                });
+        }
+        if self.shortcuts_open {
+            let muted = self.muted();
+            egui::Window::new("Keyboard shortcuts")
+                .open(&mut self.shortcuts_open)
+                .show(ui, |ui| {
+                    egui::Grid::new("shortcut-list")
+                        .num_columns(3)
+                        .spacing([16.0, 4.0])
+                        .show(ui, |ui| {
+                            for (keys, action, context) in shortcut_rows() {
+                                ui.label(egui::RichText::new(keys).monospace().strong());
+                                ui.label(action);
+                                ui.label(egui::RichText::new(context).small().color(muted));
+                                ui.end_row();
                             }
                         });
                 });
@@ -1057,7 +2156,11 @@ impl App {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button("Place in schematic >").clicked() {
+                                    if ui
+                                        .button("Place in schematic >")
+                                        .on_hover_text(command_tip("component.place_library"))
+                                        .clicked()
+                                    {
                                         self.change_tab(Tab::Schematic);
                                         self.tool = Tool::Place(t.kind.into());
                                     }
@@ -1073,6 +2176,19 @@ impl App {
         ui.add_space(24.0);
         ui.heading("Design checks");
         ui.label("Select a finding to inspect its affected object in the editor.");
+        if self
+            .checks
+            .get("erc")
+            .and_then(Value::as_array)
+            .is_none_or(|v| v.is_empty())
+            && self
+                .checks
+                .get("drc")
+                .and_then(Value::as_array)
+                .is_none_or(|v| v.is_empty())
+        {
+            empty_state(ui, EMPTY_CHECKS, self.muted());
+        }
         ui.add_space(16.0);
         let checks = self.checks.clone();
         for (key, label) in [("erc", "Electrical"), ("drc", "Board")] {
@@ -1154,6 +2270,35 @@ impl App {
     }
 }
 impl App {
+    fn copy_plot_to_clipboard(&mut self, ctx: &egui::Context) {
+        let view = if matches!(self.tab, Tab::Schematic) {
+            "schematic"
+        } else {
+            "pcb"
+        };
+        let bytes = self
+            .session
+            .lock()
+            .ok()
+            .and_then(|session| pcbcraft_io::preview_png(&session.project, view).ok())
+            .and_then(|bytes| {
+                let mut reader = std::io::Cursor::new(bytes);
+                image::load(&mut reader, image::ImageFormat::Png)
+                    .map(|image| image.into_rgba8())
+                    .ok()
+            });
+        match bytes {
+            Some(image) => {
+                ctx.copy_image(egui::ColorImage::from_rgba_unmultiplied(
+                    [image.width() as usize, image.height() as usize],
+                    image.as_raw(),
+                ));
+                self.message = "plot copied to the clipboard".into();
+            }
+            None => self.message = "copy failed: no plot to copy".into(),
+        }
+    }
+
     fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.refresh();
@@ -1161,23 +2306,27 @@ impl App {
         self.shortcuts(&ctx);
         self.header(ui);
         self.footer(ui);
-        self.browser(ui);
-        self.inspector(ui);
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(self.surface()))
-            .show(ui, |ui| match self.tab {
-                Tab::Schematic | Tab::Pcb => self.canvas(ui),
-                Tab::Libraries => {
-                    egui::ScrollArea::vertical()
-                        .show(ui, |ui| self.library(ui))
-                        .inner
-                }
-                Tab::Checks => {
-                    egui::ScrollArea::vertical()
-                        .show(ui, |ui| self.checks_view(ui))
-                        .inner
-                }
-            });
+        if self.home_open {
+            self.start_home(ui);
+        } else {
+            self.browser(ui);
+            self.inspector(ui);
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.fill(self.surface()))
+                .show(ui, |ui| match self.tab {
+                    Tab::Schematic | Tab::Pcb => self.canvas(ui),
+                    Tab::Libraries => {
+                        egui::ScrollArea::vertical()
+                            .show(ui, |ui| self.library(ui))
+                            .inner
+                    }
+                    Tab::Checks => {
+                        egui::ScrollArea::vertical()
+                            .show(ui, |ui| self.checks_view(ui))
+                            .inner
+                    }
+                });
+        }
         self.capture(&ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
     }
@@ -1203,6 +2352,997 @@ fn pcbcraft_io_limit() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_board_objects_describe_themselves_in_the_properties_panel() -> Result<(), String> {
+        let shared = pcbcraft_mcp::shared(pcbcraft_engine::Session::default());
+        let made = |command: &str, params: Value| -> Result<u64, String> {
+            shared
+                .lock()
+                .map_err(|_| "session lock unavailable")?
+                .execute(command, params, None)
+                .map_err(|e| e.to_string())?["result"]["id"]
+                .as_u64()
+                .ok_or_else(|| format!("{command} returned no id"))
+        };
+        let net = made("net.create", json!({"name":"PWR"}))?;
+        let track = made(
+            "track.add",
+            json!({"net":net,"start":{"x":0.0,"y":0.0},"end":{"x":10.0,"y":0.0},"width":0.3}),
+        )?;
+        let via = made(
+            "via.place",
+            json!({"net":net,"position":{"x":5.0,"y":5.0},"diameter":0.7,"drill":0.3}),
+        )?;
+        let zone = made(
+            "zone.place",
+            json!({"net":net,"layer":"F.Cu","outline":[{"x":0.0,"y":0.0},{"x":10.0,"y":0.0},{"x":10.0,"y":10.0},{"x":0.0,"y":10.0},{"x":0.0,"y":0.0}]}),
+        )?;
+        let text = made(
+            "text.place",
+            json!({"text":"REV A","position":{"x":20.0,"y":20.0},"size":1.5,"layer":"F.Cu"}),
+        )?;
+        let label = made(
+            "label.place",
+            json!({"kind":"label","net":net,"position":{"x":1.0,"y":1.0}}),
+        )?;
+        let project = shared
+            .lock()
+            .map_err(|_| "session lock unavailable")?
+            .project
+            .clone();
+        let find = |id: u64, name: &str| {
+            object_detail_rows(&project, id)
+                .into_iter()
+                .find(|(row, _)| row == name)
+                .map(|(_, value)| value)
+        };
+        assert_eq!(
+            find(track, "Net").as_deref(),
+            Some("PWR"),
+            "a track names its net"
+        );
+        assert_eq!(
+            find(track, "Width").as_deref(),
+            Some("0.300 mm"),
+            "a track states its width"
+        );
+        assert_eq!(
+            find(via, "Drill").as_deref(),
+            Some("0.30 mm"),
+            "a via states its drill"
+        );
+        assert_eq!(
+            find(zone, "Copper").as_deref(),
+            Some("poured"),
+            "a zone states its pour"
+        );
+        assert_eq!(
+            find(zone, "Outline").as_deref(),
+            Some("5 vertices"),
+            "a zone counts its outline"
+        );
+        assert_eq!(
+            find(text, "Text").as_deref(),
+            Some("REV A"),
+            "text shows its string"
+        );
+        assert_eq!(
+            find(label, "Kind").as_deref(),
+            Some("label"),
+            "a schematic label states its kind"
+        );
+        assert!(
+            object_detail_rows(&project, 999).is_empty(),
+            "an unknown id stays quiet"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_folder_added_from_anywhere_joins_the_list_and_removal_forgets_it_again()
+    -> Result<(), String> {
+        let _turn = pcbcraft_engine::library::SOURCES_TEST_LOCK
+            .lock()
+            .map_err(|_| "source test lock unavailable")?;
+        let file =
+            std::env::temp_dir().join(format!("pcbcraft-source-e2e-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        {
+            let mut slot = pcbcraft_engine::library::SOURCES_PATH_TEST
+                .lock()
+                .map_err(|_| "source path slot unavailable")?;
+            *slot = Some(file.clone());
+        }
+        let outcome = source_round_trip(&file);
+        {
+            let mut slot = pcbcraft_engine::library::SOURCES_PATH_TEST
+                .lock()
+                .map_err(|_| "source path slot unavailable")?;
+            *slot = None;
+        }
+        let _ = std::fs::remove_file(&file);
+        outcome
+    }
+    /// The visible loop a newcomer follows: type a folder, press Add folder,
+    /// watch its collections appear, select one, press Remove source, and
+    /// watch both the list and the remembered config forget it.
+    fn source_round_trip(file: &std::path::Path) -> Result<(), String> {
+        let shared = pcbcraft_mcp::shared(pcbcraft_engine::Session::default());
+        let mut app = App::create(shared, Preferences::default(), None, None);
+        app.change_tab(Tab::Libraries);
+        app.refresh();
+        let ctx = egui::Context::default();
+        for _ in 0..80 {
+            frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+            if app.library.catalog.is_some() && app.library.sources.is_some() {
+                break;
+            }
+        }
+        assert!(
+            app.library.catalog.is_some(),
+            "the catalog arrives on its own"
+        );
+        let shelf = std::fs::canonicalize(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../library/tests/fixtures"),
+        )
+        .map_err(|e| format!("fixture shelf missing: {e}"))?
+        .to_string_lossy()
+        .into_owned();
+        app.library.new_source = shelf.clone();
+        authoring::tests::tap(&ctx, &mut app, "Add folder")?;
+        let mut added = false;
+        for _ in 0..80 {
+            frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+            if app.library.notice.contains("Added") {
+                added = true;
+                break;
+            }
+        }
+        assert!(
+            added,
+            "adding the folder reports back: {}",
+            app.library.notice
+        );
+        let saved =
+            std::fs::read_to_string(file).map_err(|e| format!("config not written: {e}"))?;
+        assert!(
+            saved.contains(&shelf),
+            "the folder is remembered in the config file"
+        );
+        let mut listed = false;
+        for _ in 0..80 {
+            frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+            listed = app
+                .library
+                .catalog
+                .as_ref()
+                .and_then(|catalog| catalog.get("symbol_libraries"))
+                .and_then(Value::as_array)
+                .is_some_and(|libs| {
+                    libs.iter().any(|lib| {
+                        lib.get("path")
+                            .and_then(Value::as_str)
+                            .is_some_and(|path| path.starts_with(&shelf))
+                    })
+                });
+            if listed {
+                break;
+            }
+        }
+        assert!(
+            listed,
+            "the added folder's collections join the unified list"
+        );
+        let added_path = app
+            .library
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.get("symbol_libraries"))
+            .and_then(Value::as_array)
+            .and_then(|libs| {
+                libs.iter().find_map(|lib| {
+                    lib.get("path")
+                        .and_then(Value::as_str)
+                        .filter(|path| path.starts_with(&shelf))
+                        .map(str::to_owned)
+                })
+            })
+            .ok_or("the added collection vanished from the list")?;
+        app.library.path = added_path;
+        authoring::tests::tap(&ctx, &mut app, "Remove source")?;
+        let mut removed = false;
+        for _ in 0..80 {
+            frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+            if app.library.notice.contains("Removed") {
+                removed = true;
+                break;
+            }
+        }
+        assert!(removed, "removal reports back: {}", app.library.notice);
+        let saved = std::fs::read_to_string(file).map_err(|_| "config vanished")?;
+        assert!(
+            !saved.contains(&shelf),
+            "the forgotten folder is out of the config file"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_file_menu_is_where_you_open_save_and_start_a_design() -> Result<(), String> {
+        let shared = pcbcraft_mcp::shared(pcbcraft_engine::Session::default());
+        let mut app = App::create(shared, Preferences::default(), None, None);
+        app.refresh();
+        let file = std::env::temp_dir()
+            .join(format!(
+                "pcbcraft-menu-save-{}.pcbcraft",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        app.path = file.clone();
+        let ctx = egui::Context::default();
+        for _ in 0..4 {
+            frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        }
+        assert!(
+            !paints_text(&ctx, &mut app, "Project file")?,
+            "the old bottom file strip is gone; file jobs live in the File menu"
+        );
+        app.tool_call("sample_design", json!({}));
+        authoring::tests::tap(&ctx, &mut app, "File")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            !paints_text(&ctx, &mut app, "Load LED example")?,
+            "the example lives on the start screen, not in the menu"
+        );
+        authoring::tests::tap(&ctx, &mut app, "Save")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            app.message.starts_with("save"),
+            "saving answers: {}",
+            app.message
+        );
+        assert!(
+            std::fs::metadata(&file).is_ok_and(|m| m.len() > 0),
+            "the design lands in the file the menu names"
+        );
+        authoring::tests::tap(&ctx, &mut app, "File")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        authoring::tests::tap(&ctx, &mut app, "New")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            app.project.components.is_empty(),
+            "New empties the design: {} parts left",
+            app.project.components.len()
+        );
+        authoring::tests::tap(&ctx, &mut app, "Edit")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        authoring::tests::tap(&ctx, &mut app, "Undo")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            app.message.starts_with("undo"),
+            "undo answers: {}",
+            app.message
+        );
+        assert!(
+            !app.project.components.is_empty(),
+            "undo brings the design back"
+        );
+        let _ = std::fs::remove_file(&file);
+        Ok(())
+    }
+    /// True when the named words appear anywhere on screen this frame or the
+    /// next two, so tests can assert what a person actually sees.
+    fn paints_text(ctx: &egui::Context, app: &mut App, needle: &str) -> Result<bool, String> {
+        for _ in 0..3 {
+            let output = frame(ctx, app, vec![], egui::Modifiers::NONE);
+            if output.shapes.iter().any(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    return text.galley.text().contains(needle);
+                }
+                false
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[test]
+    fn a_drawn_shape_from_a_file_becomes_the_board_edge_and_back_again() -> Result<(), String> {
+        let file =
+            std::env::temp_dir().join(format!("pcbcraft-board-edge-{}.svg", std::process::id()));
+        std::fs::write(
+            &file,
+            r#"<svg width="30mm" height="20mm" stroke="none"><polygon points="1,1 29,1 29,19 15,19 1,12" stroke="edge"/><line x1="2mm" y1="2mm" x2="28mm" y2="2mm" stroke="artwork"/></svg>"#,
+        )
+        .map_err(|e| e.to_string())?;
+        let shared = pcbcraft_mcp::shared(pcbcraft_engine::Session::default());
+        let mut app = App::create(shared, Preferences::default(), None, None);
+        app.refresh();
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            paints_text(&ctx, &mut app, "BOARD EDGE")?,
+            "the board's edge lives in its own plain-language section"
+        );
+        app.svg_path = file.to_string_lossy().into_owned();
+        authoring::tests::tap(&ctx, &mut app, "Import as board edge")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        let corners = app.project.board.outline.as_ref().map_or(0, |o| o.len());
+        assert!(
+            corners >= 3,
+            "the drawn shape became the board edge: {corners} corners"
+        );
+        assert!(
+            paints_text(&ctx, &mut app, "Back to a plain rectangle")?,
+            "the shape explains itself and offers a way back"
+        );
+        authoring::tests::tap(&ctx, &mut app, "Back to a plain rectangle")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            app.project.board.outline.is_none_or(|o| o.len() < 3),
+            "the board is a plain rectangle again"
+        );
+        let _ = std::fs::remove_file(&file);
+        Ok(())
+    }
+
+    #[test]
+    fn switching_a_layer_off_hides_it_on_the_sheet_without_touching_the_design()
+    -> Result<(), String> {
+        let shared = pcbcraft_mcp::shared(pcbcraft_engine::Session::default());
+        let mut app = App::create(shared, Preferences::default(), None, None);
+        app.refresh();
+        app.tool_call("sample_design", json!({}));
+        let revision = {
+            let session = app.session.lock().map_err(|_| "session unavailable")?;
+            session.revision
+        };
+        let wire_count = |app: &mut App, ctx: &egui::Context| -> Result<usize, String> {
+            let output = frame(ctx, app, vec![], egui::Modifiers::NONE);
+            Ok(output
+                .shapes
+                .iter()
+                .filter(|shape| {
+                    matches!(
+                        &shape.shape,
+                        egui::Shape::Path(path) if (path.stroke.width - 1.8).abs() < 0.01
+                    )
+                })
+                .count())
+        };
+        let ctx = egui::Context::default();
+        let before = wire_count(&mut app, &ctx)?;
+        assert!(before > 0, "the worked example is wired up");
+        authoring::tests::tap(&ctx, &mut app, "Layers")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            paints_text(&ctx, &mut app, "Wires")?,
+            "the layers page lists wires as its own row"
+        );
+        authoring::tests::tap(&ctx, &mut app, "Wires")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            app.preferences.hidden_layers.iter().any(|h| h == "Wires"),
+            "unticking the row hides the wires layer"
+        );
+        let after = wire_count(&mut app, &ctx)?;
+        assert!(
+            after < before,
+            "the wires vanish from the sheet: {before} strokes became {after}"
+        );
+        let now = {
+            let session = app.session.lock().map_err(|_| "session unavailable")?;
+            session.revision
+        };
+        assert_eq!(
+            now, revision,
+            "hiding a layer is only a view change; the design itself is untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_newcomer_searches_for_a_part_and_it_is_ready_to_place() -> Result<(), String> {
+        let shared = pcbcraft_mcp::shared(pcbcraft_engine::Session::default());
+        let mut app = App::create(shared, Preferences::default(), None, None);
+        app.refresh();
+        app.tool_call("sample_design", json!({}));
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        authoring::tests::tap(&ctx, &mut app, "Add part")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            paints_text(&ctx, &mut app, "Search parts by name")?,
+            "the part search opens with a box that says what to type"
+        );
+        authoring::tests::tap(&ctx, &mut app, "Search parts by name")?;
+        for letter in "resistor".chars() {
+            frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::Text(letter.into())],
+                egui::Modifiers::NONE,
+            );
+        }
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert_eq!(
+            app.part_search, "resistor",
+            "typing in the search box arrives letter by letter"
+        );
+        assert!(
+            paints_text(&ctx, &mut app, "Resistor")?,
+            "the matching part stays in the list"
+        );
+        assert!(
+            !paints_text(&ctx, &mut app, "Capacitor")?,
+            "parts that do not match the search disappear from the list"
+        );
+        authoring::tests::tap(&ctx, &mut app, "Resistor")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            matches!(&app.tool, Tool::Place(kind) if kind == "resistor"),
+            "picking the part arms the schematic to place it, got {:?}",
+            app.tool
+        );
+        assert_eq!(
+            app.tab,
+            Tab::Schematic,
+            "the sheet comes forward to receive it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selection_grows_handles_and_the_old_button_bar_is_gone() -> Result<(), String> {
+        let shared = pcbcraft_mcp::shared(pcbcraft_engine::Session::default());
+        let mut app = App::create(shared, Preferences::default(), None, None);
+        app.refresh();
+        app.tool_call("sample_design", json!({}));
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            !paints_text(&ctx, &mut app, "Select  Esc")?,
+            "the wall of tool buttons is gone from the top"
+        );
+        assert!(
+            !paints_text(&ctx, &mut app, "Sync to PCB >")?,
+            "sync moved into the Edit menu"
+        );
+        assert!(
+            paints_text(&ctx, &mut app, "Fit")?,
+            "a floating Fit control sits in the work area"
+        );
+        let first = app.project.components[0].id;
+        let before = app.project.components[0].rotation;
+        app.select(Some(first));
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            paints_text(&ctx, &mut app, "Rotate")?,
+            "a selected part grows a Rotate handle beside it"
+        );
+        authoring::tests::tap(&ctx, &mut app, "Rotate")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        let after = app
+            .project
+            .component(first)
+            .map(|c| c.rotation)
+            .unwrap_or(before);
+        assert!(
+            (after - before).abs() > 1e-6,
+            "the handle turns the part: {before} -> {after}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_nets_tab_adds_names_and_shines_a_spotlight() -> Result<(), String> {
+        let shared = pcbcraft_mcp::shared(pcbcraft_engine::Session::default());
+        let mut app = App::create(shared, Preferences::default(), None, None);
+        app.refresh();
+        app.tool_call("sample_design", json!({}));
+        let before = app.project.nets.len();
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        authoring::tests::tap(&ctx, &mut app, "Nets")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            paints_text(&ctx, &mut app, "New net")?,
+            "the Nets tab offers a way to add a connection"
+        );
+        authoring::tests::tap(&ctx, &mut app, "New net")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert_eq!(
+            app.project.nets.len(),
+            before + 1,
+            "one click adds one named connection"
+        );
+        let added = app.project.nets.len() - 1;
+        let fresh = app.project.nets[added].name.clone();
+        authoring::tests::tap(&ctx, &mut app, &fresh)?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert_eq!(
+            app.highlight_net,
+            Some(app.project.nets[added].id),
+            "clicking a net lights it up on the board"
+        );
+        let fresh_id = app.project.nets[added].id;
+        app.net_draft = Some((fresh_id, "Flashlight".into()));
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        authoring::tests::tap(&ctx, &mut app, "Use name")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            app.project
+                .nets
+                .iter()
+                .any(|n| n.id == fresh_id && n.name == "Flashlight"),
+            "the rename sticks: {}",
+            app.message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_start_screen_is_the_first_thing_a_newcomer_sees() -> Result<(), String> {
+        let shared = pcbcraft_mcp::shared(pcbcraft_engine::Session::default());
+        let mut app = App::create(shared, Preferences::default(), None, None);
+        app.refresh();
+        app.home_open = true;
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            paints_text(&ctx, &mut app, "New design")?,
+            "the start screen offers a blank page"
+        );
+        assert!(
+            paints_text(&ctx, &mut app, "Worked example")?,
+            "the start screen offers something to explore"
+        );
+        authoring::tests::tap(&ctx, &mut app, "Worked example")?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            !app.home_open,
+            "picking the example leaves the start screen"
+        );
+        assert!(
+            !app.project.components.is_empty(),
+            "the example fills the design from one click"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_start_screen_lists_designs_you_can_open_again() -> Result<(), String> {
+        let _turn = pcbcraft_engine::recents::RECENTS_TEST_LOCK
+            .lock()
+            .map_err(|_| "test lock unavailable")?;
+        let directory =
+            std::env::temp_dir().join(format!("pcbcraft-home-recents-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        *pcbcraft_engine::recents::RECENTS_PATH_TEST
+            .lock()
+            .map_err(|_| "test lock unavailable")? = Some(directory.join("recent-designs.json"));
+        pcbcraft_engine::recents::clear_recent_paths();
+        let shared = pcbcraft_mcp::shared(pcbcraft_engine::Session::default());
+        let mut app = App::create(shared, Preferences::default(), None, None);
+        app.refresh();
+        let file = directory
+            .join("flashlight.pcbcraft")
+            .to_string_lossy()
+            .into_owned();
+        app.path = file.clone();
+        app.tool_call("sample_design", json!({}));
+        app.tool_call("save", json!({"path": file}));
+        app.home_open = true;
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            paints_text(&ctx, &mut app, "flashlight.pcbcraft")?,
+            "a design you saved is listed for one-click return"
+        );
+        let want = app.path.clone();
+        authoring::tests::tap(&ctx, &mut app, &want)?;
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert!(
+            !app.home_open,
+            "clicking a recent design opens it and leaves the start screen"
+        );
+        pcbcraft_engine::recents::clear_recent_paths();
+        *pcbcraft_engine::recents::RECENTS_PATH_TEST
+            .lock()
+            .map_err(|_| "test lock unavailable")? = None;
+        let _ = std::fs::remove_dir_all(&directory);
+        Ok(())
+    }
+
+    #[test]
+    fn the_library_split_pages_now_open_one_unified_page() -> Result<(), String> {
+        let shared = pcbcraft_mcp::shared(pcbcraft_engine::Session::default());
+        let mut app = App::create(shared, Preferences::default(), None, None);
+        app.refresh();
+        app.change_tab(Tab::Libraries);
+        app.library.editor.mode = 1; // an old split-view selection
+        let ctx = egui::Context::default();
+        let output = frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert_eq!(
+            app.library.editor.mode, 0,
+            "the separate project page is gone; one library shows everything"
+        );
+        assert_eq!(output.viewport_output.len(), 1, "the unified page paints");
+        Ok(())
+    }
+
+    #[test]
+    fn the_library_browser_groups_collections_by_the_source_they_came_from() {
+        let catalog = json!({"symbol_libraries":[
+            {"name":"Device","path":"/installed/Device.kicad_sym","source":"Installed collections"},
+            {"name":"DigiKeyParts","path":"/home/me/digikey/DigiKeyParts.kicad_sym","source":"Digi-Key shelf"},
+            {"name":"R","path":"/installed/R.kicad_sym"}
+        ]});
+        let items = catalog["symbol_libraries"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            library::entry_source(&items[2]),
+            "Installed collections",
+            "an entry without a source tag still answers with one"
+        );
+        assert_eq!(
+            library::distinct_sources(&items),
+            vec!["Digi-Key shelf", "Installed collections"],
+            "every source is named once, in list order"
+        );
+    }
+
+    #[test]
+    fn the_libraries_tab_paints_the_unified_list_from_added_sources() -> Result<(), String> {
+        let shared = pcbcraft_mcp::shared(pcbcraft_engine::Session::default());
+        let mut app = App::create(shared, Preferences::default(), None, None);
+        app.refresh();
+        app.change_tab(Tab::Libraries);
+        app.library.catalog = Some(json!({"symbol_libraries":[
+            {"name":"Device","path":"/installed/Device.kicad_sym","source":"Installed collections"},
+            {"name":"DigiKeyParts","path":"/home/me/digikey/DigiKeyParts.kicad_sym","source":"Digi-Key shelf"}
+        ],"footprint_libraries":[],"scan_truncated":false}));
+        app.library.sources = Some(json!({"sources":[
+            {"name":"Digi-Key shelf","path":"/home/me/digikey","kind":"added","symbol_libraries":1,"footprint_libraries":0},
+            {"name":"Installed collections","path":"/usr/share/design-collections","kind":"built-in","symbol_libraries":1,"footprint_libraries":0}
+        ]}));
+        app.library.results = Some(json!({"total":2,"entries":[
+            {"name":"Device","path":"/installed/Device.kicad_sym","kind":"symbol"},
+            {"name":"DigiKeyParts","path":"/home/me/digikey/DigiKeyParts.kicad_sym","kind":"symbol"}
+        ]}));
+        let ctx = egui::Context::default();
+        let output = frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert_eq!(
+            output.viewport_output.len(),
+            1,
+            "the unified library view paints"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn library_filter_narrows_listed_entries_by_name_or_description() {
+        let led = json!({"name":"LED","description":"light emitting diode"});
+        let resistor = json!({"name":"R","description":"resistor"});
+        assert!(
+            library::entry_matches(&led, ""),
+            "an empty filter shows everything"
+        );
+        assert!(
+            library::entry_matches(&led, "lig"),
+            "descriptions match too"
+        );
+        assert!(
+            library::entry_matches(&resistor, "RESIST"),
+            "the filter ignores case"
+        );
+        assert!(!library::entry_matches(&resistor, "led"));
+        assert!(!library::entry_matches(&led, "9"));
+    }
+    #[test]
+    fn control_tooltips_come_from_the_command_registry() -> Result<(), String> {
+        let registry = pcbcraft_engine::commands();
+        for id in [
+            "component.add",
+            "board.sync",
+            "board.resize",
+            "object.delete",
+        ] {
+            let want = registry
+                .iter()
+                .find(|spec| spec.id == id)
+                .map(|spec| spec.description)
+                .unwrap_or_default();
+            assert!(
+                !want.is_empty() && command_tip(id) == want,
+                "the tooltip for {id} must be the registry description"
+            );
+        }
+        assert_eq!(
+            command_tip("no.such_command"),
+            "This control runs an engine command.",
+            "an unmapped id still explains itself"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_states_name_the_command_that_fills_the_panel() {
+        // Guidance must reference commands that actually exist, so a novice
+        // who follows the hint always finds a real command to run.
+        let registry: Vec<&str> = pcbcraft_engine::commands()
+            .iter()
+            .map(|spec| spec.id)
+            .collect();
+        for copy in [EMPTY_SYMBOLS, EMPTY_NETS, EMPTY_BOARD] {
+            for name in ["component.add", "netlist.import", "board.sync"] {
+                if copy.contains(name) {
+                    assert!(registry.contains(&name), "{name} must exist");
+                }
+            }
+            assert!(
+                copy.contains("component.add")
+                    || copy.contains("netlist.import")
+                    || copy.contains("board.sync"),
+                "empty guidance must name a filling command: {copy}"
+            );
+        }
+        assert!(EMPTY_CHECKS.contains("automatically"));
+    }
+
+    #[test]
+    fn no_control_asks_the_user_to_know_a_tool_brand() {
+        let brand = ["Ki", "Cad"].concat();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for file in ["lib.rs", "canvas.rs", "library.rs", "authoring.rs"] {
+            let text = std::fs::read_to_string(dir.join(file)).unwrap_or_default();
+            for line in text.lines() {
+                let code = line.split("//").next().unwrap_or("");
+                if !code.contains('"') || !code.contains(&brand) {
+                    continue;
+                }
+                let allowed = code.contains("credits the")
+                    || code.contains("-derived data")
+                    || code.contains("LICENSE-")
+                    || code.contains(".contains(&brand)")
+                    || code.contains("code.contains");
+                if !allowed {
+                    offenders.push(format!("{file}: {}", code.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "buttons and labels must speak plainly, not name other tools: {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn designs_opened_on_this_computer_are_remembered_for_the_start_screen() -> Result<(), String> {
+        let _turn = pcbcraft_engine::recents::RECENTS_TEST_LOCK
+            .lock()
+            .map_err(|_| "test lock unavailable")?;
+        let directory =
+            std::env::temp_dir().join(format!("pcbcraft-ui-recents-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        *pcbcraft_engine::recents::RECENTS_PATH_TEST
+            .lock()
+            .map_err(|_| "test lock unavailable")? = Some(directory.join("recent-designs.json"));
+        pcbcraft_engine::recents::clear_recent_paths();
+        pcbcraft_engine::recents::record_recent_path("/designs/flashlight.board.json");
+        pcbcraft_engine::recents::record_recent_path("/designs/radio.board.json");
+        let shared = pcbcraft_mcp::shared(pcbcraft_engine::Session::default());
+        let mut app = App::create(shared, Preferences::default(), None, None);
+        app.refresh();
+        assert_eq!(
+            app.recent_designs,
+            vec![
+                "/designs/radio.board.json",
+                "/designs/flashlight.board.json"
+            ],
+            "the newest design leads the list"
+        );
+        let ctx = egui::Context::default();
+        let output = frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        assert_eq!(
+            output.viewport_output.len(),
+            1,
+            "the app keeps the recent list ready for the Start screen"
+        );
+        pcbcraft_engine::recents::clear_recent_paths();
+        *pcbcraft_engine::recents::RECENTS_PATH_TEST
+            .lock()
+            .map_err(|_| "test lock unavailable")? = None;
+        let _ = std::fs::remove_dir_all(&directory);
+        Ok(())
+    }
+
+    #[test]
+    fn every_editable_field_explains_its_bounds_and_effect() {
+        // The help copy for the inspector's free-form fields must state the
+        // same limits the engine enforces, so a novice never has to guess
+        // why a value was refused.
+        assert!(FIELD_HELP_VALUE.contains("name or value"));
+        assert!(FIELD_HELP_POSITION.contains("origin"));
+        assert!(FIELD_HELP_BOARD.contains("larger than zero"));
+        assert!(FIELD_HELP_CUTOUT.contains("inside the board"));
+    }
+
+    #[test]
+    fn shortcut_list_documents_every_binding_the_app_installs() {
+        let rows = shortcut_rows();
+        let keys: Vec<&str> = rows.iter().map(|(keys, _, _)| *keys).collect();
+        for wanted in ["Ctrl+Z", "Ctrl+K", "?", "W", "X", "Delete", "Esc"] {
+            assert!(
+                keys.contains(&wanted),
+                "the shortcut list must mention {wanted}"
+            );
+        }
+        let mut seen: Vec<&str> = keys.clone();
+        seen.sort_unstable();
+        let unique = {
+            let mut v = seen.clone();
+            v.dedup();
+            v
+        };
+        assert_eq!(seen.len(), unique.len(), "no key is listed twice");
+        for (keys, action, context) in &rows {
+            assert!(!keys.is_empty() && !action.is_empty());
+            assert!(
+                [
+                    "anywhere",
+                    "schematic tab",
+                    "pcb tab",
+                    "canvas",
+                    "command palette",
+                ]
+                .contains(context),
+                "{keys} claims an unknown context {context}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_hints_name_the_next_action_for_every_tool() {
+        let select = tool_hint(&Tool::Select);
+        assert!(
+            select.contains("select") && select.contains("drag") && select.contains("zoom"),
+            "the idle hint teaches navigation: {select}"
+        );
+        let cases = [
+            (Tool::Place("resistor".into()), "symbol"),
+            (Tool::Wire(None), "first pin"),
+            (
+                Tool::Wire(Some(PinRef {
+                    component: 1,
+                    pin: "1".into(),
+                })),
+                "second pin",
+            ),
+            (Tool::Route(None), "first pad"),
+            (Tool::Route(Some((1, "1".into()))), "second pad"),
+            (Tool::Move, "drop"),
+            (Tool::Cutout, "cutout"),
+        ];
+        for (tool, verb) in cases {
+            let hint = tool_hint(&tool);
+            assert!(
+                hint.contains(verb) && hint.contains("LMB") && hint.contains("Esc"),
+                "{verb} must be spelled out for the active tool: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn palette_highlight_walks_the_list_as_a_ring() {
+        assert_eq!(step_index(0, 5, 1), 1);
+        assert_eq!(
+            step_index(4, 5, 1),
+            0,
+            "walking past the last row wraps to the first"
+        );
+        assert_eq!(
+            step_index(0, 5, -1),
+            4,
+            "walking above the first row wraps to the last"
+        );
+        assert_eq!(step_index(9, 3, 0), 2, "a stale index is pulled back");
+        assert_eq!(step_index(0, 0, 1), 0, "an empty list stays put");
+    }
+
+    #[test]
+    fn palette_filtering_matches_subsequences_of_names_and_descriptions() {
+        assert!(fuzzy_match("sync", "board.sync"));
+        assert!(fuzzy_match("bre", "board.resize"));
+        assert!(fuzzy_match("PAD", "board.pad_stack"));
+        assert!(
+            !fuzzy_match("xyz", "board.sync"),
+            "characters that are not there never match"
+        );
+        assert!(
+            !fuzzy_match("copperplating", "component.value"),
+            "order matters in a subsequence"
+        );
+    }
+
+    #[test]
+    fn palette_help_explains_every_required_parameter() -> Result<(), String> {
+        let spec = pcbcraft_engine::commands()
+            .into_iter()
+            .find(|spec| spec.id == "padstack.define")
+            .ok_or_else(|| "padstack.define must be a command".to_string())?;
+        let help = param_help(&spec);
+        assert_eq!(
+            help.len(),
+            spec.input_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map_or(0, |list| list.len()),
+            "one help line per required parameter"
+        );
+        let joined = help.join("\n");
+        assert!(joined.contains("name (text)"), "name is text: {joined}");
+        assert!(
+            joined.contains("circle or rect or oval or roundrect"),
+            "the shape options are listed: {joined}"
+        );
+        assert!(
+            joined.contains("number 0.05 to 100"),
+            "the copper bounds are stated before the first refusal: {joined}"
+        );
+        for spec in pcbcraft_engine::commands() {
+            assert_eq!(
+                param_help(&spec).len(),
+                spec.input_schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .map_or(0, |list| list.len()),
+                "{} must explain exactly its required parameters",
+                spec.id
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn palette_templates_hold_exactly_the_required_parameters() -> Result<(), String> {
+        let mut checked = 0usize;
+        for spec in pcbcraft_engine::commands() {
+            let template: Value =
+                serde_json::from_str(&params_template(&spec)).map_err(|e| e.to_string())?;
+            let object = template
+                .as_object()
+                .ok_or_else(|| format!("{} template is not an object", spec.id))?;
+            let required = spec
+                .input_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                object.len(),
+                required.len(),
+                "{} template must hold exactly the required parameters",
+                spec.id
+            );
+            for key in required.iter().filter_map(Value::as_str) {
+                assert!(
+                    object.contains_key(key),
+                    "{} template misses the required parameter {key}",
+                    spec.id
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 150, "the sweep covered the whole registry");
+        Ok(())
+    }
     fn frame(
         ctx: &egui::Context,
         app: &mut App,
@@ -1225,6 +3365,21 @@ mod tests {
         output.textures_delta.clear();
         output
     }
+    #[test]
+    fn copy_plot_renders_the_current_view_for_the_clipboard() -> Result<(), String> {
+        let session =
+            pcbcraft_mcp::shared(pcbcraft_engine::Session::sample().map_err(|e| e.to_string())?);
+        let mut app = App::create(session, Preferences::default(), None, None);
+        app.refresh();
+        let ctx = egui::Context::default();
+        app.copy_plot_to_clipboard(&ctx);
+        assert_eq!(app.message, "plot copied to the clipboard");
+        app.tab = Tab::Schematic;
+        app.copy_plot_to_clipboard(&ctx);
+        assert_eq!(app.message, "plot copied to the clipboard");
+        Ok(())
+    }
+
     #[test]
     fn tab_click_preserves_component_identity_and_rotation_undo_works() -> Result<(), String> {
         let session =
