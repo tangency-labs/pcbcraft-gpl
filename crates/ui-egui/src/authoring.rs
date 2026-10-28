@@ -124,6 +124,8 @@ fn new_footprint() -> FootprintDefinition {
         keywords: String::new(),
         pads: vec![new_pad("1", -2.5), new_pad("2", 2.5)],
         graphics: vec![rectangle("F.SilkS")],
+        model: None,
+        rules: None,
         raw_source: String::new(),
         unsupported: vec![],
     }
@@ -211,10 +213,20 @@ fn graphic(ui: &mut egui::Ui, g: &mut Graphic) {
             if points.len() > 128 {
                 ui.label("Remaining vertices are preserved.");
             }
-            if ui.button("Add vertex").clicked() && points.len() < 128 {
+            if ui
+                .button("Add vertex")
+                .on_hover_text("Append another corner to the outline.")
+                .clicked()
+                && points.len() < 128
+            {
                 points.push(Point::default());
             }
-            if ui.button("Remove last vertex").clicked() && points.len() > 2 {
+            if ui
+                .button("Remove last vertex")
+                .on_hover_text("Drop the last corner of the outline.")
+                .clicked()
+                && points.len() > 2
+            {
                 points.pop();
             }
             number(ui, "Stroke", width);
@@ -240,7 +252,11 @@ fn add_graphic(ui: &mut egui::Ui, layer: &str) -> Option<Graphic> {
     let mut result = None;
     ui.horizontal_wrapped(|ui| {
         ui.label("Add drawing:");
-        if ui.button("Line").clicked() {
+        if ui
+            .button("Line")
+            .on_hover_text("Add a straight line segment to this definition.")
+            .clicked()
+        {
             result = Some(Graphic::Line {
                 start: Point::new(-3.0, 0.0),
                 end: Point::new(3.0, 0.0),
@@ -248,10 +264,18 @@ fn add_graphic(ui: &mut egui::Ui, layer: &str) -> Option<Graphic> {
                 layer: layer.into(),
             });
         }
-        if ui.button("Rectangle").clicked() {
+        if ui
+            .button("Rectangle")
+            .on_hover_text("Add a rectangle outline to this definition.")
+            .clicked()
+        {
             result = Some(rectangle(layer));
         }
-        if ui.button("Circle").clicked() {
+        if ui
+            .button("Circle")
+            .on_hover_text("Add a circle to this definition.")
+            .clicked()
+        {
             result = Some(Graphic::Circle {
                 center: Point::default(),
                 radius: 2.0,
@@ -260,7 +284,11 @@ fn add_graphic(ui: &mut egui::Ui, layer: &str) -> Option<Graphic> {
                 layer: layer.into(),
             });
         }
-        if ui.button("Arc").clicked() {
+        if ui
+            .button("Arc")
+            .on_hover_text("Add an arc segment to this definition.")
+            .clicked()
+        {
             result = Some(Graphic::Arc {
                 start: Point::new(-3.0, 0.0),
                 mid: Point::new(0.0, -3.0),
@@ -269,7 +297,11 @@ fn add_graphic(ui: &mut egui::Ui, layer: &str) -> Option<Graphic> {
                 layer: layer.into(),
             });
         }
-        if ui.button("Polyline").clicked() {
+        if ui
+            .button("Polyline")
+            .on_hover_text("Add an open multi-segment outline to this definition.")
+            .clicked()
+        {
             result = Some(Graphic::Polyline {
                 points: vec![
                     Point::new(-2.0, 2.0),
@@ -281,7 +313,11 @@ fn add_graphic(ui: &mut egui::Ui, layer: &str) -> Option<Graphic> {
                 layer: layer.into(),
             });
         }
-        if ui.button("Text").clicked() {
+        if ui
+            .button("Text")
+            .on_hover_text("Add a text label to this definition.")
+            .clicked()
+        {
             result = Some(Graphic::Text {
                 position: Point::default(),
                 angle: 0.0,
@@ -296,15 +332,22 @@ fn add_graphic(ui: &mut egui::Ui, layer: &str) -> Option<Graphic> {
 impl App {
     pub(super) fn library_workspaces(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.library.editor.mode, 0, "Installed libraries");
-            ui.selectable_value(&mut self.library.editor.mode, 1, "Project library");
+            ui.selectable_value(&mut self.library.editor.mode, 0, "Library");
             ui.selectable_value(&mut self.library.editor.mode, 2, "Editor");
-            if ui.button("New symbol").clicked() {
+            if ui
+                .button("New symbol")
+                .on_hover_text("Start a fresh empty symbol definition.")
+                .clicked()
+            {
                 self.library.editor.draft = Some(Draft::Symbol(new_symbol()));
                 self.library.editor.mode = 2;
                 self.library.editor.notice = None;
             }
-            if ui.button("New footprint").clicked() {
+            if ui
+                .button("New footprint")
+                .on_hover_text("Start a fresh empty footprint definition.")
+                .clicked()
+            {
                 self.library.editor.draft = Some(Draft::Footprint(new_footprint()));
                 self.library.editor.mode = 2;
                 self.library.editor.notice = None;
@@ -312,21 +355,38 @@ impl App {
         });
         ui.separator();
         match self.library.editor.mode {
-            0 => self.kicad_library(ui),
-            1 => self.project_library(ui),
-            _ => self.library_editor(ui),
+            2 => self.library_editor(ui),
+            _ => {
+                self.library.editor.mode = 0;
+                self.unified_library(ui)
+            }
         }
     }
+    /// One library page: every collection from every added or installed
+    /// source, then the definitions this project can edit, in one scroll.
+    pub(super) fn unified_library(&mut self, ui: &mut egui::Ui) {
+        self.collection_browser(ui);
+        ui.separator();
+        self.project_library(ui);
+    }
     fn project_library(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Editable project library");
-        ui.label("Saved definitions live in this project. Placed components retain their embedded copies.");
+        ui.heading("This project's definitions");
+        ui.label("Saved here, live with the design; everything above is shared collections. Placed components retain their embedded copies.");
         ui.horizontal(|ui| {
             ui.label("Collection file");
             ui.text_edit_singleline(&mut self.library.editor.path);
-            if ui.button("Save library").clicked() {
+            if ui
+                .button("Save library")
+                .on_hover_text("Write the authored collections to a reusable library file.")
+                .clicked()
+            {
                 self.tool_call("library.save", json!({"path":self.library.editor.path}));
             }
-            if ui.button("Load library").clicked() {
+            if ui
+                .button("Load library")
+                .on_hover_text("Bring a saved library file into the editor.")
+                .clicked()
+            {
                 self.run("library.load", json!({"path":self.library.editor.path}));
             }
         });
@@ -336,7 +396,11 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.strong(&def.name);
                 ui.label(format!("{} physical pins", def.pins.len()));
-                if ui.button("Edit").clicked() {
+                if ui
+                    .button("Edit")
+                    .on_hover_text("Edit this definition in the panel below.")
+                    .clicked()
+                {
                     self.library.editor.draft = Some(Draft::Symbol(def.clone()));
                     self.library.editor.mode = 2;
                     self.library.editor.notice = None;
@@ -357,7 +421,11 @@ impl App {
                     self.change_tab(Tab::Schematic);
                     self.tool = Tool::CustomPlace(def.name.clone(), Box::new(def.clone()));
                 }
-                if ui.button("Remove").clicked() {
+                if ui
+                    .button("Remove")
+                    .on_hover_text("Remove this definition from the project library.")
+                    .clicked()
+                {
                     self.run("library.symbol.remove", json!({"name":def.name}));
                 }
             });
@@ -368,7 +436,11 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.strong(&def.name);
                 ui.label(format!("{} pads", def.pads.len()));
-                if ui.button("Edit").clicked() {
+                if ui
+                    .button("Edit")
+                    .on_hover_text("Edit this definition in the panel below.")
+                    .clicked()
+                {
                     self.library.editor.draft = Some(Draft::Footprint(def.clone()));
                     self.library.editor.mode = 2;
                     self.library.editor.notice = None;
@@ -395,7 +467,11 @@ impl App {
                 {
                     self.run("footprint.assign_custom", json!({"id":id,"name":def.name}));
                 }
-                if ui.button("Remove").clicked() {
+                if ui
+                    .button("Remove")
+                    .on_hover_text("Remove this definition from the project library.")
+                    .clicked()
+                {
                     self.run("library.footprint.remove", json!({"name":def.name}));
                 }
             });
@@ -429,12 +505,20 @@ impl App {
                         def.unsupported.join(", ")
                     ));
                 }
-                if ui.button("Save symbol to project library").clicked() {
+                if ui
+                    .button("Save symbol to project library")
+                    .on_hover_text("Store this symbol in the current project library.")
+                    .clicked()
+                {
                     save = Some(("library.symbol.upsert", json!({"definition":def})));
                 }
                 ui.separator();
                 ui.heading("Pins");
-                if ui.button("Duplicate preview unit").clicked() {
+                if ui
+                    .button("Duplicate preview unit")
+                    .on_hover_text("Copy the unit being edited to grow a multi-unit package.")
+                    .clicked()
+                {
                     let unit = def
                         .pins
                         .iter()
@@ -477,7 +561,12 @@ impl App {
                         self.library.preview_unit = unit;
                     }
                 }
-                if ui.button("Add pin").clicked() && def.pins.len() < 64 {
+                if ui
+                    .button("Add pin")
+                    .on_hover_text("Add a new pin to this symbol.")
+                    .clicked()
+                    && def.pins.len() < 64
+                {
                     let mut n = 1;
                     while def.pins.iter().any(|p| p.number == n.to_string()) {
                         n += 1;
@@ -521,7 +610,11 @@ impl App {
                                         ui.selectable_value(&mut pin.electrical_type, t.into(), t);
                                     }
                                 });
-                            if ui.button("Delete pin").clicked() {
+                            if ui
+                                .button("Delete pin")
+                                .on_hover_text("Remove this pin.")
+                                .clicked()
+                            {
                                 remove = Some(i);
                             }
                         });
@@ -549,7 +642,11 @@ impl App {
                                     .prefix("Unit (0 shared) "),
                             );
                             graphic(ui, &mut g.primitive);
-                            if ui.button("Delete graphic").clicked() {
+                            if ui
+                                .button("Delete graphic")
+                                .on_hover_text("Remove this graphic.")
+                                .clicked()
+                            {
                                 remove = Some(i);
                             }
                         });
@@ -570,12 +667,21 @@ impl App {
                 if let Err(e) = pcbcraft_doc::validate_footprint_support(def) {
                     ui.label(e);
                 }
-                if ui.button("Save footprint to project library").clicked() {
+                if ui
+                    .button("Save footprint to project library")
+                    .on_hover_text("Store this footprint in the current project library.")
+                    .clicked()
+                {
                     save = Some(("library.footprint.upsert", json!({"definition":def})));
                 }
                 ui.separator();
                 ui.heading("Pads");
-                if ui.button("Add pad").clicked() && def.pads.len() < 64 {
+                if ui
+                    .button("Add pad")
+                    .on_hover_text("Add a new pad to this footprint.")
+                    .clicked()
+                    && def.pads.len() < 64
+                {
                     let mut n = 1;
                     while def.pads.iter().any(|p| p.number == n.to_string()) {
                         n += 1;
@@ -598,12 +704,14 @@ impl App {
                                         &mut pad.pad_type,
                                         "smd".into(),
                                         "Front SMD",
-                                    );
+                                    )
+                                    .on_hover_text("Soldered to the board surface; no drill hole.");
                                     ui.selectable_value(
                                         &mut pad.pad_type,
                                         "thru_hole".into(),
                                         "Plated through-hole",
-                                    );
+                                    )
+                                    .on_hover_text("Drilled and plated so legs can pass through.");
                                 });
                             if before != pad.pad_type {
                                 if pad.pad_type == "thru_hole" {
@@ -622,7 +730,10 @@ impl App {
                                 .selected_text(&pad.shape)
                                 .show_ui(ui, |ui| {
                                     for shape in ["circle", "rect", "oval", "roundrect"] {
-                                        ui.selectable_value(&mut pad.shape, shape.into(), shape);
+                                        ui.selectable_value(&mut pad.shape, shape.into(), shape)
+                                            .on_hover_text(
+                                                "Copper outline of the pad; the mask follows it.",
+                                            );
                                     }
                                 });
                             if pad.shape == "roundrect" {
@@ -640,7 +751,11 @@ impl App {
                                 point(ui, "Drill offset", &mut drill.offset);
                             }
                             ui.label(format!("Layers: {}", pad.layers.join(", ")));
-                            if ui.button("Delete pad").clicked() {
+                            if ui
+                                .button("Delete pad")
+                                .on_hover_text("Remove this pad.")
+                                .clicked()
+                            {
                                 remove = Some(i);
                             }
                         });
@@ -659,7 +774,11 @@ impl App {
                     ui.push_id(("footprint-graphic", i), |ui| {
                         ui.collapsing(format!("Graphic {}", i + 1), |ui| {
                             graphic(ui, g);
-                            if ui.button("Delete graphic").clicked() {
+                            if ui
+                                .button("Delete graphic")
+                                .on_hover_text("Remove this graphic.")
+                                .clicked()
+                            {
                                 remove = Some(i);
                             }
                         });
