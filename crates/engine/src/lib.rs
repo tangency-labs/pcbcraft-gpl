@@ -128,6 +128,22 @@ pub fn commands() -> Vec<CommandSpec> {
             ),
         ),
         (
+            "wire.draw",
+            "Draw a free-form schematic wire with explicit vertices, optionally bound to a net",
+            schema(
+                json!({"points":{"type":"array","items":point_schema(),"minItems":2,"maxItems":256},"net":id_schema()}),
+                &["points"],
+            ),
+        ),
+        (
+            "graphic.add",
+            "Add a free-standing schematic or board graphic: line, rect, circle, arc, polygon or text",
+            schema(
+                json!({"layer":{"type":"string","enum":["schematic","board"]},"shape":{"type":"string","enum":["line","rect","circle","arc","polygon","text"]},"points":{"type":"array","items":point_schema(),"minItems":1,"maxItems":256},"width":{"type":"number","exclusiveMinimum":0,"maximum":1000},"text":{"type":"string","maxLength":1024}}),
+                &["layer", "shape", "points", "width"],
+            ),
+        ),
+        (
             "board.sync",
             "Reconcile schematic components and pin nets into PCB footprints; retain placements and report unassigned library symbols",
             schema(json!({}), &[]),
@@ -534,6 +550,22 @@ struct WireParams {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct DrawnWireParams {
+    points: Vec<Point>,
+    net: Option<Id>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphicParams {
+    layer: String,
+    shape: String,
+    points: Vec<Point>,
+    width: f64,
+    #[serde(default)]
+    text: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Resize {
     width: f64,
     height: f64,
@@ -808,6 +840,70 @@ fn run(p: &mut Project, next: &mut Id, command: &str, params: &Value) -> Result<
             });
             Ok(json!({"id":id,"net":net}))
         }
+        "wire.draw" => {
+            let a: DrawnWireParams = parse(params)?;
+            if a.points.len() < 2 || a.points.len() > 256 {
+                return Err(Error::Invalid("wire needs 2–256 vertices".into()));
+            }
+            if !a.points.iter().all(|p| p.valid()) {
+                return Err(Error::Invalid("wire vertex is out of range".into()));
+            }
+            if a.points.windows(2).any(|w| w[0] == w[1]) {
+                return Err(Error::Invalid("wire repeats a vertex".into()));
+            }
+            if a.net.is_some_and(|net| !p.nets.iter().any(|n| n.id == net)) {
+                return Err(missing());
+            }
+            let id = allocate(next)?;
+            let vertices = a.points.len();
+            p.drawn_wires.push(DrawnWire {
+                id,
+                net: a.net,
+                points: a.points,
+            });
+            Ok(json!({"id":id,"vertices":vertices}))
+        }
+        "graphic.add" => {
+            let a: GraphicParams = parse(params)?;
+            if a.layer != "schematic" && a.layer != "board" {
+                return Err(Error::Invalid(
+                    "graphic layer must be schematic or board".into(),
+                ));
+            }
+            let (min, max) = match pcbcraft_doc::Graphic::vertex_rule(&a.shape) {
+                Some(rule) => rule,
+                None => return Err(Error::Invalid("unknown graphic shape".into())),
+            };
+            if a.points.len() < min || a.points.len() > max {
+                return Err(Error::Invalid(
+                    "graphic has the wrong number of vertices for its shape".into(),
+                ));
+            }
+            if !a.points.iter().all(|p| p.valid()) {
+                return Err(Error::Invalid("graphic vertex is out of range".into()));
+            }
+            if !a.width.is_finite() || a.width <= 0.0 || a.width > 1_000.0 {
+                return Err(Error::Invalid(
+                    "graphic width, radius or text size must be within 0–1000mm".into(),
+                ));
+            }
+            if a.text.len() > 1024 {
+                return Err(Error::Invalid("graphic text is too long".into()));
+            }
+            if (a.shape == "text") != !a.text.is_empty() {
+                return Err(Error::Invalid("only text graphics may carry text".into()));
+            }
+            let id = allocate(next)?;
+            p.graphics.push(pcbcraft_doc::Graphic {
+                id,
+                layer: a.layer,
+                shape: a.shape,
+                points: a.points,
+                width: a.width,
+                text: a.text,
+            });
+            Ok(json!({"id":id}))
+        }
         "board.sync" => {
             if params.as_object().is_none_or(|m| !m.is_empty()) {
                 return Err(Error::Invalid("board.sync takes an empty object".into()));
@@ -951,6 +1047,9 @@ fn run(p: &mut Project, next: &mut Id, command: &str, params: &Value) -> Result<
             p.nets.retain(|n| n.id != a.id);
             p.wires
                 .retain(|w| w.id != a.id && w.from.component != a.id && w.to.component != a.id);
+            p.drawn_wires
+                .retain(|w| w.id != a.id && w.net.is_none_or(|n| n != a.id));
+            p.graphics.retain(|g| g.id != a.id);
             p.board
                 .footprints
                 .retain(|f| f.id != a.id && f.component != a.id);
@@ -971,6 +1070,97 @@ mod tests {
             .join(name)
             .to_string_lossy()
             .into_owned()
+    }
+    #[test]
+    fn drawn_wires_keep_vertices_bind_nets_and_undo_cleanly() -> Result<(), Error> {
+        let mut s = Session::default();
+        let net = s.execute("net.create", json!({"name":"N$1"}), None)?["result"]["id"]
+            .as_u64()
+            .ok_or_else(missing)?;
+        s.execute(
+            "wire.draw",
+            json!({"points":[{"x":10.0,"y":10.0},{"x":20.0,"y":10.0},{"x":20.0,"y":20.0}],"net":net}),
+            None,
+        )?;
+        assert_eq!(s.project.drawn_wires.len(), 1);
+        assert_eq!(s.project.drawn_wires[0].points.len(), 3);
+        assert_eq!(s.project.drawn_wires[0].net, Some(net));
+        assert!(s.project.validate().is_ok());
+        // A wire may be drawn before its net exists, and stays unconnected.
+        s.execute(
+            "wire.draw",
+            json!({"points":[{"x":0.0,"y":0.0},{"x":5.0,"y":0.0}]}),
+            None,
+        )?;
+        assert_eq!(s.project.drawn_wires[1].net, None);
+        // Repeated vertices and unknown nets are rejected without touching state.
+        assert!(
+            s.execute(
+                "wire.draw",
+                json!({"points":[{"x":1.0,"y":1.0},{"x":1.0,"y":1.0}]}),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            s.execute(
+                "wire.draw",
+                json!({"points":[{"x":1.0,"y":1.0},{"x":2.0,"y":1.0}],"net":9999}),
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(s.project.drawn_wires.len(), 2);
+        let drawn = s.project.drawn_wires[0].id;
+        s.execute("object.delete", json!({"id":drawn}), None)?;
+        assert_eq!(s.project.drawn_wires.len(), 1);
+        s.undo()?;
+        assert_eq!(s.project.drawn_wires.len(), 2);
+        Ok(())
+    }
+    #[test]
+    fn graphic_add_validates_each_shape_and_deletes_and_undoes_cleanly() -> Result<(), Error> {
+        let mut s = Session::default();
+        for params in [
+            json!({"layer":"schematic","shape":"line","points":[{"x":1.0,"y":1.0},{"x":10.0,"y":1.0}],"width":0.2}),
+            json!({"layer":"schematic","shape":"rect","points":[{"x":0.0,"y":0.0},{"x":5.0,"y":3.0}],"width":0.2}),
+            json!({"layer":"board","shape":"circle","points":[{"x":10.0,"y":10.0}],"width":2.0}),
+            json!({"layer":"board","shape":"arc","points":[{"x":0.0,"y":0.0},{"x":5.0,"y":7.0},{"x":10.0,"y":0.0}],"width":0.2}),
+            json!({"layer":"board","shape":"polygon","points":[{"x":0.0,"y":0.0},{"x":4.0,"y":0.0},{"x":2.0,"y":3.0}],"width":0.1}),
+            json!({"layer":"schematic","shape":"text","points":[{"x":2.0,"y":2.0}],"width":1.5,"text":"REV B"}),
+        ] {
+            s.execute("graphic.add", params, None)?;
+        }
+        assert_eq!(s.project.graphics.len(), 6);
+        assert!(s.project.validate().is_ok());
+        assert_eq!(
+            s.project
+                .graphics
+                .iter()
+                .filter(|g| g.shape == "circle")
+                .flat_map(|g| g.outline().unwrap_or_default())
+                .count(),
+            25
+        );
+        // Unknown shapes, wrong vertex counts and misuse of text are rejected
+        // without touching state.
+        for params in [
+            json!({"layer":"schematic","shape":"spline","points":[{"x":1.0,"y":1.0}],"width":0.2}),
+            json!({"layer":"schematic","shape":"line","points":[{"x":1.0,"y":1.0}],"width":0.2}),
+            json!({"layer":"schematic","shape":"text","points":[{"x":1.0,"y":1.0}],"width":1.0}),
+            json!({"layer":"schematic","shape":"line","points":[{"x":1.0,"y":1.0},{"x":2.0,"y":1.0}],"width":0.2,"text":"oops"}),
+            json!({"layer":"copper","shape":"line","points":[{"x":1.0,"y":1.0},{"x":2.0,"y":1.0}],"width":0.2}),
+            json!({"layer":"schematic","shape":"line","points":[{"x":1.0,"y":1.0},{"x":2.0,"y":1.0}],"width":0.0}),
+        ] {
+            assert!(s.execute("graphic.add", params, None).is_err());
+        }
+        assert_eq!(s.project.graphics.len(), 6);
+        let graphic = s.project.graphics[2].id;
+        s.execute("object.delete", json!({"id":graphic}), None)?;
+        assert_eq!(s.project.graphics.len(), 5);
+        s.undo()?;
+        assert_eq!(s.project.graphics.len(), 6);
+        Ok(())
     }
     #[test]
     fn imported_definitions_survive_roundtrip_and_assignment_is_undoable() -> Result<(), Error> {
