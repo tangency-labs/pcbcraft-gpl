@@ -1,9 +1,92 @@
 use super::*;
 use egui::{Pos2, Sense};
-use pcbcraft_doc::{Component, Layer};
+use pcbcraft_doc::{Component, Layer, PinRef};
 use pcbcraft_geom::point_segment;
+mod board_art;
+mod underlay;
 
-fn snap(p: Point) -> Point {
+pub(super) enum CanvasMenuKind {
+    Empty,
+    Pin(PinRef),
+    Pad(Id, String),
+    Track(Id),
+    Object(Id),
+}
+
+/// The world rectangle each tab should show by default: the board outline on
+/// the PCB tab, everything drawn on the schematic tab, falling back to the
+/// default sheet area so a fresh project still frames sensibly.
+fn view_bounds(project: &Project, pcb: bool) -> (Point, Point) {
+    let mut pts: Vec<Point> = Vec::new();
+    if pcb {
+        if let Some(ring) = &project.board.outline {
+            pts.extend(ring.iter().copied());
+        }
+        if pts.is_empty() {
+            pts.push(Point::new(0.0, 0.0));
+            pts.push(Point::new(project.board.width, project.board.height));
+        }
+    } else {
+        for c in &project.components {
+            pts.push(c.position);
+        }
+        for w in &project.drawn_wires {
+            pts.extend(w.points.iter().copied());
+        }
+        for l in &project.labels {
+            pts.push(l.position);
+        }
+        for g in &project.graphics {
+            pts.extend(g.points.iter().copied());
+        }
+        if pts.is_empty() {
+            pts.push(Point::new(0.0, 0.0));
+            pts.push(Point::new(80.0, 48.0));
+        }
+    }
+    let mut lo = pts[0];
+    let mut hi = pts[0];
+    for p in &pts {
+        lo = Point::new(lo.x.min(p.x), lo.y.min(p.y));
+        hi = Point::new(hi.x.max(p.x), hi.y.max(p.y));
+    }
+    let pad = 2.0;
+    (
+        Point::new(lo.x - pad, lo.y - pad),
+        Point::new(hi.x + pad, hi.y + pad),
+    )
+}
+
+/// Zoom and centre that fit a world rectangle inside a panel, keeping the
+/// whole design visible instead of a postage stamp at the minimum zoom.
+pub(crate) fn fit_camera(lo: Point, hi: Point, panel: (f32, f32)) -> Camera {
+    let w = (hi.x - lo.x).max(1.0);
+    let h = (hi.y - lo.y).max(1.0);
+    let zoom = ((panel.0 * 0.92) as f64 / w)
+        .min((panel.1 * 0.92) as f64 / h)
+        .clamp(0.02, 100.0) as f32;
+    Camera {
+        center: Point::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0),
+        zoom,
+    }
+}
+
+/// Net spotlight: copper on the spotlighted net takes the accent colour and
+/// everything else fades, so one click can trace a net across the board.
+fn spotlight(lit: Option<Id>, net: Option<Id>, base: Color32, hot: Color32) -> Color32 {
+    match lit {
+        None => base,
+        Some(hot_net) => {
+            if net == Some(hot_net) {
+                hot
+            } else {
+                base.gamma_multiply(0.25)
+            }
+        }
+    }
+}
+
+pub(crate) fn snap(p: Point) -> Point {
     Point::new((p.x * 2.0).round() / 2.0, (p.y * 2.0).round() / 2.0)
 }
 fn fill_polygon(painter: &egui::Painter, points: &[Pos2], color: Color32, clip: Rect) {
@@ -82,9 +165,107 @@ fn fill_polygon(painter: &egui::Painter, points: &[Pos2], color: Color32, clip: 
         }
     }
 }
+/// Ray-cast point-in-polygon test for closed outlines (first vertex repeated).
+pub(crate) fn polygon_contains(points: &[Point], pos: Point) -> bool {
+    let mut inside = false;
+    for edge in points.windows(2) {
+        let (a, b) = (edge[0], edge[1]);
+        if (a.y > pos.y) != (b.y > pos.y) && pos.x < (b.x - a.x) * (pos.y - a.y) / (b.y - a.y) + a.x
+        {
+            inside = !inside;
+        }
+    }
+    inside
+}
+/// The small pictures drawn on the floating canvas controls.
+#[derive(Clone, Copy)]
+enum CanvasIcon {
+    Fit,
+    Move,
+    Rotate,
+}
+impl App {
+    /// One square icon button over the canvas. Its rectangle is published for
+    /// the tests under `id`.
+    fn canvas_icon(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: &str,
+        icon: CanvasIcon,
+        tip: &str,
+    ) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+        let response = response.on_hover_text(tip);
+        let name = match icon {
+            CanvasIcon::Fit => "Fit",
+            CanvasIcon::Move => "Move",
+            CanvasIcon::Rotate => "Rotate",
+        };
+        crate::a11y::name_control(&response, name, None);
+        self.record_icon(id, rect);
+        let ink = if response.hovered() {
+            self.accent()
+        } else {
+            self.ink()
+        };
+        let fill = self.colours().icon_fill;
+        let painter = ui.painter();
+        painter.rect_filled(rect, 6.0, fill);
+        painter.rect_stroke(
+            rect,
+            6.0,
+            Stroke::new(1.0, self.ink().gamma_multiply(0.35)),
+            egui::StrokeKind::Inside,
+        );
+        let stroke = Stroke::new(1.6, ink);
+        let c = rect.center();
+        let at = |x: f32, y: f32| egui::pos2(c.x + x, c.y + y);
+        match icon {
+            CanvasIcon::Fit => {
+                // A frame: four corner brackets.
+                for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                    let corner = at(sx * 7.0, sy * 7.0);
+                    painter.line_segment([corner, at(sx * 7.0, sy * 3.0)], stroke);
+                    painter.line_segment([corner, at(sx * 3.0, sy * 7.0)], stroke);
+                }
+            }
+            CanvasIcon::Move => {
+                painter.line_segment([at(-7.0, 0.0), at(7.0, 0.0)], stroke);
+                painter.line_segment([at(0.0, -7.0), at(0.0, 7.0)], stroke);
+                for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                    let tip = at(dx * 7.0, dy * 7.0);
+                    let back =
+                        |a: f32, b: f32| at(dx * (7.0 - a) + dy * b, dy * (7.0 - a) + dx * b);
+                    painter.line_segment([tip, back(3.0, 2.5)], stroke);
+                    painter.line_segment([tip, back(3.0, -2.5)], stroke);
+                }
+            }
+            CanvasIcon::Rotate => {
+                let mut points = Vec::new();
+                for step in 0..=10 {
+                    let a = -0.3 + step as f32 * 0.5;
+                    points.push(at(7.0 * a.cos(), 7.0 * a.sin()));
+                }
+                painter.add(egui::Shape::line(points, stroke));
+                let tip = at(7.0 * (-0.3_f32).cos(), 7.0 * (-0.3_f32).sin());
+                painter.line_segment([tip, tip + Vec2::new(-4.0, -1.0)], stroke);
+                painter.line_segment([tip, tip + Vec2::new(1.0, 4.5)], stroke);
+            }
+        }
+        response
+    }
+}
+impl App {
+    /// Copper colour for one net under the current spotlight: the lit net
+    /// glows in the accent colour, other copper fades away.
+    fn copper(&self, net: Option<Id>, base: Color32) -> Color32 {
+        spotlight(self.highlight_net, net, base, self.accent())
+    }
+}
+
 impl App {
     pub(super) fn select_at(&mut self, pos: Point, zoom: f32) {
-        let id = self.pick_object(pos, zoom);
+        let id = self.pick_filtered(pos, zoom);
         self.select(id);
         if self.tab == Tab::Schematic
             && let Some(c) = id.and_then(|id| self.project.component(id))
@@ -121,7 +302,7 @@ impl App {
             self.load_properties();
         }
     }
-    fn paint_graphic(
+    pub(super) fn paint_graphic(
         &self,
         painter: &egui::Painter,
         rect: Rect,
@@ -194,20 +375,29 @@ impl App {
         }
     }
     pub(super) fn canvas(&mut self, ui: &mut egui::Ui) {
-        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+        let (response, painter) = ui.allocate_painter(
+            ui.available_size(),
+            Sense::click_and_drag().union(Sense::hover()),
+        );
         let rect = response.rect;
+        self.canvas_rect = rect;
         let mut camera = if self.tab == Tab::Pcb {
             self.pcb
         } else {
             self.schematic
         };
+        if self.needs_fit && rect.width() > 40.0 && rect.height() > 40.0 {
+            let (lo, hi) = view_bounds(&self.project, self.tab == Tab::Pcb);
+            camera = fit_camera(lo, hi, (rect.width(), rect.height()));
+            self.needs_fit = false;
+        }
         if response.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            let scroll = motion::wheel_zoom_delta(ui, self.preferences.reduced_motion);
             if scroll.abs() > 0.01
                 && let Some(mouse) = ui.input(|i| i.pointer.hover_pos())
             {
                 let before = camera.world(mouse, rect);
-                camera.zoom = (camera.zoom * (scroll * 0.003).exp()).clamp(1.0, 100.0);
+                camera.zoom = (camera.zoom * (scroll * 0.003).exp()).clamp(0.02, 100.0);
                 let after = camera.world(mouse, rect);
                 camera.center = camera
                     .center
@@ -228,6 +418,15 @@ impl App {
         }
         let cursor = response.hover_pos().map(|p| camera.world(p, rect));
         self.cursor = cursor;
+        if let Some(released) = response.dnd_release_payload::<Value>() {
+            let world = response
+                .hover_pos()
+                .or_else(|| ui.input(|i| i.pointer.hover_pos()))
+                .map(|p| camera.world(p, rect));
+            if let Some(world) = world {
+                self.place_dropped_library(&released, world);
+            }
+        }
         let mut visible = self.project.clone();
         if let Some((id, pos)) = self.drag {
             if let Some(c) = visible.components.iter_mut().find(|c| c.id == id) {
@@ -242,8 +441,16 @@ impl App {
                 f.position = pos;
             }
         }
+        let focus = if self.tab == Tab::Pcb {
+            self.focus_layer.clone()
+        } else {
+            None
+        };
+        if let Some(focus) = &focus {
+            Self::apply_layer_focus(&mut visible, focus);
+        }
         painter.rect_filled(rect, 0.0, self.surface());
-        if self.preferences.grid {
+        if self.preferences.grid && self.layer_shown("Grid") {
             let grid = if camera.zoom < 5.0 { 5.0 } else { 1.0 };
             let step = grid * camera.zoom;
             let zero = camera.screen(Point::default(), rect);
@@ -265,18 +472,24 @@ impl App {
         } else {
             self.paint_board(&painter, rect, camera, &visible);
         }
+        self.paint_edit_overlay(&painter, rect, camera);
         let text = match &self.tool {
-            Tool::Select => "SELECT",
-            Tool::Place(_) => "PLACE SYMBOL · CLICK TO COMMIT",
+            Tool::Select => t!("board.canvas.select"),
+            Tool::Place(_) => t!("board.canvas.place_symbol_click_to_commit"),
             Tool::LibraryPlace(..) | Tool::CustomPlace(..) => {
-                "PLACE SYMBOL PACKAGE · CLICK TO COMMIT"
+                t!("board.canvas.place_symbol_package_click_to")
             }
-            Tool::Wire(None) => "WIRE · PICK FIRST PIN",
-            Tool::Wire(Some(_)) => "WIRE · PICK SECOND PIN",
-            Tool::Route(None) => "ROUTE · PICK FIRST PAD",
-            Tool::Route(Some(_)) => "ROUTE · PICK SECOND PAD",
-            Tool::Move => "MOVE · CLICK TO PLACE SELECTION",
-            Tool::Cutout => "CUTOUT · CLICK TO PLACE",
+            Tool::Wire(None) => t!("board.canvas.wire_pick_first_pin"),
+            Tool::Wire(Some(_)) => t!("board.canvas.wire_pick_second_pin"),
+            Tool::Route(None) => t!("board.canvas.route_pick_first_pad"),
+            Tool::Route(Some(_)) => t!("board.canvas.route_pick_second_pad"),
+            Tool::Move => t!("board.canvas.move_click_to_place_selection"),
+            Tool::Cutout => t!("board.canvas.cutout_click_to_place"),
+            Tool::Hole => t!("board.canvas.mounting_hole_click_to_drill"),
+            Tool::NoConnect => t!("board.canvas.no_connect_click_a_pin"),
+            Tool::Fiducial => t!("board.canvas.assembly_mark_click_a_clear"),
+            Tool::DrawLayer => t!("board.canvas.draw_shape_pick_the_layer"),
+            Tool::Measure => t!("board.canvas.measure_click_two_points"),
         };
         painter.text(
             rect.left_top() + Vec2::new(20.0, 20.0),
@@ -285,6 +498,33 @@ impl App {
             FontId::monospace(10.0),
             self.muted(),
         );
+        if let Some(focus) = &focus {
+            let label = match focus.as_str() {
+                "copper:front" => "Top copper".to_owned(),
+                "copper:back" => "Bottom copper".to_owned(),
+                _ => focus.trim_start_matches("art:").to_owned(),
+            };
+            painter.text(
+                rect.left_top() + Vec2::new(20.0, 40.0),
+                Align2::LEFT_TOP,
+                t!("board.canvas.focused_on_label_tap_the", label = label),
+                FontId::monospace(10.0),
+                self.accent(),
+            );
+        }
+        if let Some(hovered) = response.dnd_hover_payload::<Value>() {
+            let name = hovered
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("part");
+            painter.text(
+                rect.left_top() + Vec2::new(20.0, 38.0),
+                Align2::LEFT_TOP,
+                t!("board.canvas.release_to_place_name_where", name = name),
+                FontId::monospace(10.0),
+                self.accent(),
+            );
+        }
         if let Some(pos) = cursor {
             let snapped = snap(pos);
             match &self.tool {
@@ -308,6 +548,20 @@ impl App {
                             self.symbol(&painter, rect, camera, &view, false, true);
                         }
                     }
+                }
+                Tool::Fiducial => {
+                    painter.circle_stroke(
+                        camera.screen(snapped, rect),
+                        (self.fiducial_diameter / 2.0) as f32 * camera.zoom,
+                        Stroke::new(1.5, self.accent()),
+                    );
+                }
+                Tool::Hole => {
+                    painter.circle_stroke(
+                        camera.screen(snapped, rect),
+                        (self.hole_diameter / 2.0) as f32 * camera.zoom,
+                        Stroke::new(1.5, self.accent()),
+                    );
                 }
                 Tool::Cutout if pcbcraft_geom::positive(self.cutout_radius) => {
                     painter.circle_stroke(
@@ -340,8 +594,58 @@ impl App {
                             camera,
                             start,
                             snapped,
-                            Stroke::new(3.0, Color32::from_rgb(245, 141, 121)),
+                            Stroke::new(3.0, self.colours().canvas.front),
                         );
+                    }
+                }
+                Tool::DrawLayer => {
+                    let stroke = Stroke::new(1.0, self.accent());
+                    match self.art_shape {
+                        DrawShape::Words => {
+                            if !self.art_text.trim().is_empty() {
+                                painter.text(
+                                    camera.screen(snapped, rect),
+                                    Align2::LEFT_TOP,
+                                    &self.art_text,
+                                    FontId::proportional(11.0),
+                                    self.accent(),
+                                );
+                            }
+                        }
+                        DrawShape::Poly => {
+                            let mut pts: Vec<Pos2> = self
+                                .art_points
+                                .iter()
+                                .map(|pt| camera.screen(*pt, rect))
+                                .collect();
+                            pts.push(camera.screen(snapped, rect));
+                            if pts.len() >= 2 {
+                                painter.add(egui::Shape::line(pts, stroke));
+                            }
+                        }
+                        _ => {
+                            if let Some(start) = self.art_start {
+                                let a = camera.screen(start, rect);
+                                let b = camera.screen(snapped, rect);
+                                match self.art_shape {
+                                    DrawShape::Line => {
+                                        painter.line_segment([a, b], stroke);
+                                    }
+                                    DrawShape::Rect => {
+                                        painter.rect_stroke(
+                                            egui::Rect::from_min_max(a, b),
+                                            0.0,
+                                            stroke,
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    }
+                                    _ => {
+                                        let radius = (b - a).length().max(1.0);
+                                        painter.circle_stroke(a, radius, stroke);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -351,9 +655,15 @@ impl App {
             && matches!(self.tool, Tool::Select)
             && let Some(pos) = cursor
         {
-            self.select_at(pos, camera.zoom);
+            let shift = ui.input(|i| i.modifiers.shift);
+            match self.pick_filtered(pos, camera.zoom) {
+                Some(hit) if self.promote_member(hit) => {}
+                Some(_) => self.select_at(pos, camera.zoom),
+                None => self.begin_box(pos, shift),
+            }
             let id = self.selected;
-            if let Some(id) = id
+            if self.edit.box_from.is_none()
+                && let Some(id) = id
                 && (self.project.component(id).is_some() || self.project.footprint(id).is_some())
             {
                 let original = self
@@ -367,6 +677,15 @@ impl App {
             }
         }
         if response.dragged_by(egui::PointerButton::Primary)
+            && self.edit.box_from.is_some()
+            && let Some(pos) = cursor
+        {
+            self.edit.box_to = Some(pos);
+        }
+        if response.drag_stopped_by(egui::PointerButton::Primary) && self.edit.box_from.is_some() {
+            self.finish_box();
+        }
+        if response.dragged_by(egui::PointerButton::Primary)
             && let (Some((id, _)), Some(pos)) = (self.drag, cursor)
         {
             self.drag = Some((id, snap(pos.offset(self.drag_offset))));
@@ -374,26 +693,313 @@ impl App {
         if response.drag_stopped_by(egui::PointerButton::Primary)
             && let Some((id, pos)) = self.drag.take()
         {
-            let mut params = json!({"id":id,"position":pos});
-            if self.project.component(id).is_some() {
-                params["unit"] = json!(self.selected_unit);
+            if self.selection().len() > 1
+                && let Some(origin) = self.drag_origin(id)
+            {
+                self.move_selection(pos.x - origin.x, pos.y - origin.y);
+            } else {
+                let mut params = json!({"id":id,"position":pos});
+                if self.project.component(id).is_some() {
+                    params["unit"] = json!(self.selected_unit);
+                }
+                self.run(
+                    if self.project.footprint(id).is_some() {
+                        "footprint.move"
+                    } else {
+                        "component.move"
+                    },
+                    params,
+                );
             }
-            self.run(
-                if self.project.footprint(id).is_some() {
-                    "footprint.move"
-                } else {
-                    "component.move"
-                },
-                params,
-            );
         }
-        if response.clicked()
-            && let Some(pos) = cursor
+        if ui.input(|i| i.key_pressed(egui::Key::Enter))
+            && matches!(self.tool, Tool::DrawLayer)
+            && self.art_shape == DrawShape::Poly
+            && self.art_layer.is_some()
+            && self.art_points.len() >= 3
         {
-            self.canvas_click(pos, camera.zoom);
+            let layer = self.art_layer.unwrap_or_default();
+            self.commit_poly(layer);
+        }
+        if response.clicked() {
+            self.canvas_menu = None;
+            if let Some(pos) = cursor {
+                if matches!(self.tool, Tool::Select) && ui.input(|i| i.modifiers.shift) {
+                    self.shift_click(pos, camera.zoom);
+                } else {
+                    self.canvas_click(pos, camera.zoom);
+                }
+            }
+        }
+        if response.secondary_clicked()
+            && let Some(pos) = cursor
+            && let Some(screen) = response.interact_pointer_pos()
+        {
+            if matches!(self.tool, Tool::Select) && ui.input(|i| i.modifiers.shift) {
+                self.shift_click(pos, camera.zoom);
+            } else {
+                self.open_canvas_menu(screen, pos, camera.zoom);
+            }
+        }
+        // Fit and zoom stay on the canvas; board/schematic tools live in the strip under the tabs.
+        egui::Area::new(egui::Id::new("fit-fab"))
+            .pivot(Align2::RIGHT_TOP)
+            .fixed_pos(rect.right_top() + Vec2::new(-12.0, 12.0))
+            .constrain_to(rect)
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    if self
+                        .canvas_icon(
+                            ui,
+                            "canvas-fit",
+                            CanvasIcon::Fit,
+                            &t!("board.canvas.fit_zoom_the_view_so"),
+                        )
+                        .clicked()
+                    {
+                        self.needs_fit = true;
+                    }
+                    if ui
+                        .tap_button(t!("board.canvas.text"))
+                        .on_hover_text(t!("board.canvas.text.tip"))
+                        .clicked()
+                    {
+                        let zoom = if self.tab == Tab::Pcb {
+                            &mut self.pcb.zoom
+                        } else {
+                            &mut self.schematic.zoom
+                        };
+                        *zoom = (*zoom * 1.15).clamp(0.02, 100.0);
+                    }
+                    if ui
+                        .tap_button(t!("board.canvas.text2"))
+                        .on_hover_text(t!("board.canvas.text2.tip"))
+                        .clicked()
+                    {
+                        let zoom = if self.tab == Tab::Pcb {
+                            &mut self.pcb.zoom
+                        } else {
+                            &mut self.schematic.zoom
+                        };
+                        *zoom = (*zoom / 1.15).clamp(0.02, 100.0);
+                    }
+                });
+            });
+        if matches!(self.tab, Tab::Schematic | Tab::Pcb)
+            && let Some(id) = self.selected
+        {
+            let world = self
+                .project
+                .component(id)
+                .and_then(|c| c.unit_placement(self.selected_unit).map(|p| p.0))
+                .or_else(|| self.project.footprint(id).map(|f| f.position));
+            if let Some(at) = world {
+                let screen = camera.screen(at, rect);
+                if rect.contains(screen) {
+                    let flip_left = screen.x > rect.right() - 72.0;
+                    let (pivot, fixed) = if flip_left {
+                        (Align2::RIGHT_BOTTOM, screen + Vec2::new(-12.0, -34.0))
+                    } else {
+                        (Align2::LEFT_BOTTOM, screen + Vec2::new(12.0, -34.0))
+                    };
+                    egui::Area::new(egui::Id::new("selection-handles"))
+                        .pivot(pivot)
+                        .fixed_pos(fixed)
+                        .constrain_to(rect)
+                        .order(egui::Order::Foreground)
+                        .show(ui.ctx(), |ui| {
+                            ui.horizontal(|ui| {
+                                if self
+                                    .canvas_icon(
+                                        ui,
+                                        "handle-move",
+                                        CanvasIcon::Move,
+                                        &t!("board.canvas.move_drop_the_selected_object"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.tool = Tool::Move;
+                                }
+                                if self
+                                    .canvas_icon(
+                                        ui,
+                                        "handle-rotate",
+                                        CanvasIcon::Rotate,
+                                        &command_tip("component.rotate"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.rotate();
+                                }
+                            });
+                        });
+                }
+            }
+        }
+        if let Some((screen, kind)) = self.canvas_menu.take() {
+            let mut close = false;
+            egui::Area::new(egui::Id::new("canvas-context-menu"))
+                .fixed_pos(screen)
+                .order(egui::Order::Foreground)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::menu(ui.style())
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.set_min_width(140.0);
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            close |= self.paint_canvas_menu(ui, &kind);
+                        });
+                });
+            if !close {
+                self.canvas_menu = Some((screen, kind));
+            }
         }
     }
-    fn pick_object(&self, pos: Point, zoom: f32) -> Option<Id> {
+    /// Draw the shapes the designer put on their own layers. Cut layers read
+    /// as a strong outline, perforation layers are dotted so they say
+    /// "break apart here", and the rest stay quiet so copper stays loudest.
+    /// Keep only what a focused tree row points at: one copper face or one
+    /// drawn machine layer. Everything else falls back to plain board colour.
+    fn apply_layer_focus(p: &mut Project, focus: &str) {
+        let board = &mut p.board;
+        match focus.strip_prefix("copper:") {
+            Some("front") => {
+                board.tracks.retain(|t| t.layer == Layer::Front);
+                board.zones.retain(|z| z.layer == Layer::Front);
+                board.texts.retain(|t| t.layer == Layer::Front);
+                board.vias.clear();
+            }
+            Some("back") => {
+                board.tracks.retain(|t| t.layer == Layer::Back);
+                board.zones.retain(|z| z.layer == Layer::Back);
+                board.texts.retain(|t| t.layer == Layer::Back);
+                board.vias.clear();
+            }
+            _ => {}
+        }
+        if let Some(name) = focus.strip_prefix("art:") {
+            board.tracks.clear();
+            board.zones.clear();
+            board.texts.clear();
+            board.vias.clear();
+            board.user_layers.retain(|l| l.name == name);
+        }
+    }
+
+    fn draw_user_layers(&self, painter: &egui::Painter, rect: Rect, camera: Camera, p: &Project) {
+        for layer in &p.board.user_layers {
+            if !layer.visible {
+                continue;
+            }
+            let colour = match layer.kind {
+                pcbcraft_doc::ArtKind::Cut => self.colours().canvas.front,
+                pcbcraft_doc::ArtKind::Perforation => self.colours().canvas.pad,
+                pcbcraft_doc::ArtKind::Silk => self.ink(),
+                pcbcraft_doc::ArtKind::Mask => self.colours().canvas.mask,
+                pcbcraft_doc::ArtKind::Other => self.ink().linear_multiply(0.55),
+            };
+            let stroke = Stroke::new(1.2, colour);
+            let dotted = layer.dotted;
+            for shape in &layer.shapes {
+                match shape {
+                    pcbcraft_doc::ArtShape::Line { start, end } => {
+                        Self::push_art(
+                            painter,
+                            vec![camera.screen(*start, rect), camera.screen(*end, rect)],
+                            stroke,
+                            dotted,
+                        );
+                    }
+                    pcbcraft_doc::ArtShape::Rect {
+                        x,
+                        y,
+                        width,
+                        height,
+                        rotate,
+                    } => {
+                        let center = Point::new(x + width / 2.0, y + height / 2.0);
+                        let mut ring: Vec<Pos2> = [
+                            Point::new(*x, *y),
+                            Point::new(x + width, *y),
+                            Point::new(x + width, y + height),
+                            Point::new(*x, y + height),
+                        ]
+                        .into_iter()
+                        .map(|c| {
+                            center
+                                .offset(Point::new(c.x - center.x, c.y - center.y).rotate(*rotate))
+                        })
+                        .map(|c| camera.screen(c, rect))
+                        .collect();
+                        ring.push(ring[0]);
+                        Self::push_art(painter, ring, stroke, dotted);
+                    }
+                    pcbcraft_doc::ArtShape::Circle { center, radius } => {
+                        let c = camera.screen(*center, rect);
+                        let r = (*radius as f32 * camera.zoom).max(1.0);
+                        let ring: Vec<Pos2> = (0..=48)
+                            .map(|i| {
+                                let a = std::f32::consts::TAU * i as f32 / 48.0;
+                                c + egui::vec2(a.cos() * r, a.sin() * r)
+                            })
+                            .collect();
+                        Self::push_art(painter, ring, stroke, dotted);
+                    }
+                    pcbcraft_doc::ArtShape::Poly { points } => {
+                        if points.len() < 2 {
+                            continue;
+                        }
+                        let mut ring: Vec<Pos2> =
+                            points.iter().map(|pt| camera.screen(*pt, rect)).collect();
+                        ring.push(ring[0]);
+                        Self::push_art(painter, ring, stroke, dotted);
+                    }
+                    pcbcraft_doc::ArtShape::Text { at, text, size, .. } => {
+                        painter.text(
+                            camera.screen(*at, rect),
+                            Align2::LEFT_TOP,
+                            text,
+                            FontId::proportional((*size as f32 * camera.zoom).clamp(6.0, 36.0)),
+                            colour,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// One polyline in the layer's style: plain, or broken into dashes when
+    /// the layer is a perforation layer.
+    fn push_art(painter: &egui::Painter, points: Vec<Pos2>, stroke: Stroke, dotted: bool) {
+        if dotted {
+            for shape in egui::Shape::dashed_line(&points, stroke, 2.0, 3.0) {
+                painter.add(shape);
+            }
+        } else {
+            painter.add(egui::Shape::line(points, stroke));
+        }
+    }
+
+    /// Close the outline started with the outline draw tool, if enough
+    /// corners exist, and hand it to the engine.
+    fn commit_poly(&mut self, layer: Id) {
+        let points: Vec<[f64; 2]> = self
+            .art_points
+            .iter()
+            .map(|pt| {
+                let q = snap(*pt);
+                [q.x, q.y]
+            })
+            .collect();
+        self.art_points.clear();
+        self.run(
+            "board.layer_poly_add",
+            json!({"layer": layer, "points": points}),
+        );
+    }
+
+    pub(super) fn pick_object(&self, pos: Point, zoom: f32) -> Option<Id> {
         if self.tab == Tab::Schematic {
             self.project
                 .components
@@ -457,6 +1063,15 @@ impl App {
             {
                 return Some(c.id);
             }
+            if let Some(z) = self
+                .project
+                .board
+                .zones
+                .iter()
+                .find(|z| polygon_contains(&z.outline, pos))
+            {
+                return Some(z.id);
+            }
             self.project
                 .board
                 .tracks
@@ -492,6 +1107,51 @@ impl App {
         }
         None
     }
+    /// When both clicked pads sit on the same net of a declared differential
+    /// pair, the pad each of those footprints has on the partner net, so one
+    /// drag routes both sides. None when the net is not paired or a footprint
+    /// has no single partner pad.
+    fn pair_mates(
+        &self,
+        from: Id,
+        from_pad: &str,
+        to: Id,
+        to_pad: &str,
+    ) -> Option<(String, String)> {
+        let net_of = |fp: Id, number: &str| {
+            self.project
+                .footprint(fp)?
+                .pads
+                .iter()
+                .find(|p| p.number == number)?
+                .net
+        };
+        let net = net_of(from, from_pad)?;
+        if net_of(to, to_pad)? != net {
+            return None;
+        }
+        let pair = self
+            .project
+            .board
+            .diff_pairs
+            .iter()
+            .find(|d| d.net_p == net || d.net_n == net)?;
+        let partner = if pair.net_p == net {
+            pair.net_n
+        } else {
+            pair.net_p
+        };
+        let mate = |fp: Id| {
+            let f = self.project.footprint(fp)?;
+            let mut on_partner = f.pads.iter().filter(|p| p.net == Some(partner));
+            let first = on_partner.next()?;
+            if on_partner.next().is_some() {
+                return None;
+            }
+            Some(first.number.clone())
+        };
+        Some((mate(from)?, mate(to)?))
+    }
     fn pick_pad(&self, pos: Point, zoom: f32) -> Option<(Id, String)> {
         for f in &self.project.board.footprints {
             for pad in &f.pads {
@@ -505,9 +1165,481 @@ impl App {
         }
         None
     }
-    fn canvas_click(&mut self, pos: Point, zoom: f32) {
+    /// The wire whose path passes nearest the click, within a fingertip's
+    /// width; curved wires are checked along their bow too.
+    fn pick_track(&self, pos: Point, zoom: f32) -> Option<Id> {
+        let mut best: Option<(f64, Id)> = None;
+        for track in &self.project.board.tracks {
+            let mut reach = segment_distance(pos, track.start, track.end);
+            if let Some(mid) = track.arc {
+                reach = reach
+                    .min(segment_distance(pos, track.start, mid))
+                    .min(segment_distance(pos, mid, track.end));
+            }
+            if reach * (zoom as f64) < 6.0 && best.is_none_or(|(known, _)| reach < known) {
+                best = Some((reach, track.id));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+    fn pick_via(&self, pos: Point, zoom: f32) -> Option<Id> {
+        self.project
+            .board
+            .vias
+            .iter()
+            .filter(|v| {
+                pos.distance(v.position) * (zoom as f64)
+                    < (v.diameter as f32 * zoom / 2.0 + 6.0) as f64
+            })
+            .min_by(|a, b| {
+                a.position
+                    .distance(pos)
+                    .total_cmp(&b.position.distance(pos))
+            })
+            .map(|v| v.id)
+    }
+    fn canvas_menu_target(&self, pos: Point, zoom: f32) -> CanvasMenuKind {
+        if self.tab == Tab::Schematic
+            && let Some(pin) = self.pick_pin(pos, zoom)
+        {
+            return CanvasMenuKind::Pin(pin);
+        }
+        if self.tab == Tab::Pcb {
+            if let Some((id, pad)) = self.pick_pad(pos, zoom) {
+                return CanvasMenuKind::Pad(id, pad);
+            } else if let Some(id) = self.pick_via(pos, zoom) {
+                return CanvasMenuKind::Object(id);
+            } else if let Some(id) = self.pick_track(pos, zoom) {
+                return CanvasMenuKind::Track(id);
+            }
+        }
+        if let Some(id) = self.pick_object(pos, zoom) {
+            return CanvasMenuKind::Object(id);
+        }
+        CanvasMenuKind::Empty
+    }
+    fn open_canvas_menu(&mut self, screen: Pos2, pos: Point, zoom: f32) {
+        let kind = self.canvas_menu_target(pos, zoom);
+        match &kind {
+            CanvasMenuKind::Empty => self.select(None),
+            CanvasMenuKind::Pin(pin) => {
+                self.select(Some(pin.component));
+                self.load_properties();
+            }
+            CanvasMenuKind::Pad(id, _) => {
+                self.select(Some(*id));
+                self.load_properties();
+            }
+            CanvasMenuKind::Track(id) => {
+                self.select(Some(*id));
+                if let Some(track) = self.project.board.tracks.iter().find(|t| t.id == *id) {
+                    self.track_width = track.width;
+                }
+                self.load_properties();
+            }
+            CanvasMenuKind::Object(id) => {
+                self.select_at(pos, zoom);
+                if self.selected != Some(*id) {
+                    self.select(Some(*id));
+                }
+                self.load_properties();
+            }
+        }
+        self.edit.menu_at = Some(pos);
+        self.canvas_menu = Some((screen, kind));
+    }
+    /// "Assign layers": the spans this board allows for a via, each running
+    /// `via.set_span`. The span the via already has is marked in text.
+    fn assign_span_menu(&mut self, ui: &mut egui::Ui, id: Id) -> bool {
+        let Some(via) = self.project.board.vias.iter().find(|v| v.id == id).cloned() else {
+            return false;
+        };
+        let current = self.project.via_span(&via);
+        let last = self.project.copper_layer_count().saturating_sub(1);
+        let tip = command_tip("via.set_span");
+        let mut done = false;
+        ui.menu_button("Assign layers", |ui| {
+            for (a, b) in self.project.allowed_via_spans() {
+                let mut label = if a.index() == 0 && b.index() >= last {
+                    "Top to bottom".to_string()
+                } else {
+                    format!(
+                        "{} to {}",
+                        self.project.layer_name(a),
+                        self.project.layer_name(b)
+                    )
+                };
+                if (a, b) == current {
+                    label.push_str(" (current)");
+                }
+                if Self::canvas_menu_button(ui, &label, &tip) {
+                    self.run(
+                        "via.set_span",
+                        json!({
+                            "id": id,
+                            "from_layer": self.project.layer_name(a),
+                            "to_layer": self.project.layer_name(b),
+                        }),
+                    );
+                    done = true;
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text("Choose which copper layers this via connects.");
+        done
+    }
+    /// "Copy" for menus that open on a part's pad or pin: the part is already
+    /// selected by the right-click, so this copies the whole part.
+    fn copy_part_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        let tip = command_tip("selection.copy_text");
+        if Self::canvas_menu_button(ui, "Copy", &tip) {
+            let ctx = ui.ctx().clone();
+            self.copy_selection(&ctx);
+            return true;
+        }
+        false
+    }
+    fn canvas_menu_button(ui: &mut egui::Ui, label: &str, tip: &str) -> bool {
+        ui.button(label).on_hover_text(tip).clicked()
+    }
+    /// "Assign layer": a small submenu listing the copper faces a track can
+    /// move to. The face it is already on is left out.
+    fn assign_layer_menu(&mut self, ui: &mut egui::Ui, id: Id) -> bool {
+        let Some(current) = self
+            .project
+            .board
+            .tracks
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.layer)
+        else {
+            return false;
+        };
+        let mut done = false;
+        ui.menu_button("Assign layer", |ui| {
+            for (layer, label, name, tip) in [
+                (
+                    Layer::Front,
+                    "Front",
+                    "F.Cu",
+                    "Move this wire to the front copper layer.",
+                ),
+                (
+                    Layer::Back,
+                    "Back",
+                    "B.Cu",
+                    "Move this wire to the back copper layer.",
+                ),
+            ] {
+                if layer == current {
+                    continue;
+                }
+                if Self::canvas_menu_button(ui, label, tip) {
+                    self.run("track.set_layer", json!({"id": id, "layer": name}));
+                    done = true;
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text("Choose which copper layer this wire lives on.");
+        done
+    }
+    fn paint_canvas_menu(&mut self, ui: &mut egui::Ui, kind: &CanvasMenuKind) -> bool {
+        match kind {
+            CanvasMenuKind::Empty => {
+                if Self::canvas_menu_button(
+                    ui,
+                    "Fit view",
+                    "Zoom the view so the whole design fits.",
+                ) {
+                    self.needs_fit = true;
+                    return true;
+                }
+                let ready = self.edit.clip.is_some();
+                let paste_tip = if ready {
+                    command_tip("selection.paste")
+                } else {
+                    "Copy something first".to_string()
+                };
+                if ui
+                    .add_enabled(ready, egui::Button::new("Paste"))
+                    .on_hover_text(&paste_tip)
+                    .on_disabled_hover_text(&paste_tip)
+                    .clicked()
+                {
+                    if let Some(at) = self.edit.menu_at {
+                        self.paste_last_copy_at(at);
+                    }
+                    return true;
+                }
+                if Self::canvas_menu_button(
+                    ui,
+                    "Clear selection",
+                    "Drop the current highlight so nothing is selected.",
+                ) {
+                    self.select(None);
+                    return true;
+                }
+            }
+            CanvasMenuKind::Pin(pin) => {
+                if self.copy_part_menu(ui) {
+                    return true;
+                }
+                if Self::canvas_menu_button(
+                    ui,
+                    "Start wire",
+                    "Wire tool: click another pin to connect them.",
+                ) {
+                    self.tool = Tool::Wire(Some(PinRef {
+                        component: pin.component,
+                        pin: pin.pin.clone(),
+                    }));
+                    return true;
+                }
+                if Self::canvas_menu_button(
+                    ui,
+                    "Mark no connect",
+                    "Mark this pin deliberately unconnected, or clear an existing mark.",
+                ) {
+                    self.tool = Tool::NoConnect;
+                    return true;
+                }
+                if Self::canvas_menu_button(
+                    ui,
+                    "Properties",
+                    "Load this pin's part into the inspector.",
+                ) {
+                    self.load_properties();
+                    return true;
+                }
+            }
+            CanvasMenuKind::Pad(id, pad) => {
+                if self.copy_part_menu(ui) {
+                    return true;
+                }
+                if Self::canvas_menu_button(
+                    ui,
+                    "Start route",
+                    "Route tool: click another pad to draw a track between them.",
+                ) {
+                    self.tool = Tool::Route(Some((*id, pad.clone())));
+                    return true;
+                }
+                if Self::canvas_menu_button(
+                    ui,
+                    "Properties",
+                    "Load this pad's package into the inspector.",
+                ) {
+                    self.load_properties();
+                    return true;
+                }
+            }
+            CanvasMenuKind::Track(id) => {
+                if Self::canvas_menu_button(
+                    ui,
+                    "Cut",
+                    "Break this stretch of wire into two equal halves so you can bend, branch or re-route part of it. Undo joins it back into one.",
+                ) {
+                    if let Some(track) = self.project.board.tracks.iter().find(|t| t.id == *id) {
+                        let at = Point::new(
+                            (track.start.x + track.end.x) / 2.0,
+                            (track.start.y + track.end.y) / 2.0,
+                        );
+                        self.run(
+                            "track.split",
+                            json!({"id": *id, "at": {"x": at.x, "y": at.y}}),
+                        );
+                    }
+                    return true;
+                }
+                if Self::canvas_menu_button(
+                    ui,
+                    "Change width",
+                    "Set this wire to the width shown in the inspector.",
+                ) {
+                    self.run(
+                        "track.set_width",
+                        json!({"id": *id, "width": self.track_width}),
+                    );
+                    return true;
+                }
+                if self.assign_layer_menu(ui, *id) {
+                    return true;
+                }
+                if Self::canvas_menu_button(ui, "Properties", "Load this wire into the inspector.")
+                {
+                    self.load_properties();
+                    return true;
+                }
+                let delete_tip = command_tip("object.delete");
+                if Self::canvas_menu_button(ui, "Delete", &delete_tip) {
+                    self.run("object.delete", json!({"id": *id}));
+                    self.select(None);
+                    return true;
+                }
+            }
+            CanvasMenuKind::Object(id) => {
+                let copy_tip = command_tip("selection.copy_text");
+                if Self::canvas_menu_button(ui, "Copy", &copy_tip) {
+                    let ctx = ui.ctx().clone();
+                    self.copy_selection(&ctx);
+                    return true;
+                }
+                if self.project.board.vias.iter().any(|v| v.id == *id)
+                    && self.assign_span_menu(ui, *id)
+                {
+                    return true;
+                }
+                let is_track = self.project.board.tracks.iter().any(|t| t.id == *id);
+                let component = self.project.component(*id).is_some();
+                let footprint = self.project.footprint(*id).is_some();
+                if component || footprint {
+                    if Self::canvas_menu_button(
+                        ui,
+                        "Duplicate",
+                        "Places a copy of this part nearby, with its own new reference number. Undo removes the copy.",
+                    ) {
+                        let target = self.project.footprint(*id).map_or(*id, |fp| fp.component);
+                        self.run(
+                            "object.duplicate",
+                            json!({"ids": [target], "offset": {"x": 2.0, "y": 2.0}}),
+                        );
+                        return true;
+                    }
+                    let part_locked = self
+                        .project
+                        .footprint(*id)
+                        .is_some_and(|fp| fp.locked == Some(true));
+                    let rotate_tip = if part_locked {
+                        "This part is locked. Unlock it first."
+                    } else {
+                        "Turn the selected object by 90 degrees."
+                    };
+                    if ui
+                        .add_enabled(!part_locked, egui::Button::new("Rotate"))
+                        .on_hover_text(rotate_tip)
+                        .on_disabled_hover_text(rotate_tip)
+                        .clicked()
+                    {
+                        self.rotate();
+                        return true;
+                    }
+                    if footprint {
+                        let locked = self
+                            .project
+                            .footprint(*id)
+                            .is_some_and(|fp| fp.locked == Some(true));
+                        if Self::canvas_menu_button(
+                            ui,
+                            if locked { "Unlock" } else { "Lock in place" },
+                            if locked {
+                                "Let this part move, rotate and dock again."
+                            } else {
+                                "Freeze this part so no accidental click, key or dock can nudge it off where you placed it."
+                            },
+                        ) {
+                            self.run(
+                                "footprint.set_locked",
+                                json!({"id": *id, "locked": !locked}),
+                            );
+                            return true;
+                        }
+                    }
+                }
+                if is_track {
+                    if Self::canvas_menu_button(
+                        ui,
+                        "Cut",
+                        "Break this stretch of wire into two equal halves so you can bend, branch or re-route part of it. Undo joins it back into one.",
+                    ) {
+                        if let Some(track) = self.project.board.tracks.iter().find(|t| t.id == *id)
+                        {
+                            let at = Point::new(
+                                (track.start.x + track.end.x) / 2.0,
+                                (track.start.y + track.end.y) / 2.0,
+                            );
+                            self.run(
+                                "track.split",
+                                json!({"id": *id, "at": {"x": at.x, "y": at.y}}),
+                            );
+                        }
+                        return true;
+                    }
+                    if Self::canvas_menu_button(
+                        ui,
+                        "Change width",
+                        "Set this wire to the width shown in the inspector.",
+                    ) {
+                        self.run(
+                            "track.set_width",
+                            json!({"id": *id, "width": self.track_width}),
+                        );
+                        return true;
+                    }
+                    if self.assign_layer_menu(ui, *id) {
+                        return true;
+                    }
+                }
+                if Self::canvas_menu_button(
+                    ui,
+                    "Properties",
+                    "Load this object into the inspector.",
+                ) {
+                    self.load_properties();
+                    return true;
+                }
+                let part_locked = self
+                    .project
+                    .footprint(*id)
+                    .is_some_and(|fp| fp.locked == Some(true));
+                let delete_tip = if part_locked {
+                    "This part is locked. Unlock it first.".to_string()
+                } else {
+                    command_tip("object.delete")
+                };
+                if ui
+                    .add_enabled(!part_locked, egui::Button::new("Delete"))
+                    .on_hover_text(&delete_tip)
+                    .on_disabled_hover_text(&delete_tip)
+                    .clicked()
+                {
+                    self.run("object.delete", json!({"id": *id}));
+                    self.select(None);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    pub(super) fn canvas_click(&mut self, pos: Point, zoom: f32) {
         match self.tool.clone() {
-            Tool::Select => self.select_at(pos, zoom),
+            Tool::Select => {
+                self.select_at(pos, zoom);
+                // A click on a pin or pad starts a wire or a track straight
+                // away; no tool button has to be armed first.
+                if self.tab == Tab::Schematic
+                    && let Some(pin) = self.pick_pin(pos, zoom)
+                {
+                    self.tool = Tool::Wire(Some(pin));
+                } else if self.tab == Tab::Pcb
+                    && let Some((id, pad)) = self.pick_pad(pos, zoom)
+                {
+                    self.tool = Tool::Route(Some((id, pad)));
+                } else if self.tab == Tab::Pcb
+                    && self.selected.is_none()
+                    && let Some(id) = self.pick_track(pos, zoom)
+                {
+                    self.select(Some(id));
+                    if let Some(track) = self.project.board.tracks.iter().find(|t| t.id == id) {
+                        self.track_width = track.width;
+                    }
+                    self.message = t!("board.canvas_click.wire_picked_change_its_width");
+                }
+            }
+            Tool::Measure => self.measure_click(pos, zoom),
             Tool::Place(kind) => {
                 self.run("component.add", json!({"kind":kind,"position":snap(pos)}))
             }
@@ -542,30 +1674,145 @@ impl App {
                 if let Some(pin) = self.pick_pin(pos, zoom) {
                     if let Some(start) = start {
                         self.run("wire.connect", json!({"from":start,"to":pin}));
-                        self.tool = Tool::Wire(None);
+                        self.tool = Tool::Select;
                     } else {
                         self.tool = Tool::Wire(Some(pin));
                     }
                 } else {
-                    self.message = "Wire endpoints must be symbol pins".into();
+                    self.message = t!("board.canvas_click.wire_endpoints_must_be_symbol");
                 }
             }
             Tool::Route(start) => {
                 if let Some((id, pad)) = self.pick_pad(pos, zoom) {
                     if let Some((from, from_pad)) = start {
-                        self.run("track.route",json!({"from":{"footprint":from,"pad":from_pad},"to":{"footprint":id,"pad":pad},"layer":self.route_layer}));
-                        self.tool = Tool::Route(None);
+                        let mode = if self.preferences.chamfer_corners {
+                            "octilinear"
+                        } else {
+                            "orthogonal"
+                        };
+                        if let Some((mate_from, mate_to)) =
+                            self.pair_mates(from, &from_pad, id, &pad)
+                        {
+                            self.run(
+                                "track.route_pair",
+                                json!({
+                                    "from_p":{"footprint":from,"pad":from_pad},
+                                    "from_n":{"footprint":from,"pad":mate_from},
+                                    "to_p":{"footprint":id,"pad":pad},
+                                    "to_n":{"footprint":id,"pad":mate_to},
+                                    "layer":self.route_layer,
+                                    "mode":mode,
+                                }),
+                            );
+                        } else {
+                            self.run("track.route",json!({"from":{"footprint":from,"pad":from_pad},"to":{"footprint":id,"pad":pad},"layer":self.route_layer,"mode":mode}));
+                        }
+                        self.tool = Tool::Select;
                     } else {
                         self.tool = Tool::Route(Some((id, pad)));
                     }
                 } else {
-                    self.message = "Pick a pad to start or finish a route".into();
+                    self.message = t!("board.canvas_click.pick_a_pad_to_start");
                 }
             }
+            Tool::Fiducial => self.run(
+                "board.fiducial_place",
+                json!({"position":snap(pos),"diameter":self.fiducial_diameter}),
+            ),
+            Tool::NoConnect => {
+                if let Some(pin) = self.pick_pin(pos, zoom) {
+                    if let Some(id) = self
+                        .project
+                        .no_connects
+                        .iter()
+                        .find(|f| f.pin == pin)
+                        .map(|f| f.id)
+                    {
+                        self.run("object.delete", json!({"id": id}));
+                    } else {
+                        self.run("pin.no_connect", json!({"pin": pin}));
+                    }
+                }
+            }
+            Tool::Hole => self.run(
+                "board.hole_place",
+                json!({"position":snap(pos),"diameter":self.hole_diameter}),
+            ),
             Tool::Cutout => self.run(
                 "board.cutout.add",
                 json!({"center":snap(pos),"radius":self.cutout_radius}),
             ),
+            Tool::DrawLayer => {
+                let Some(layer) = self.art_layer else {
+                    self.message = t!("board.canvas_click.pick_or_make_a_layer");
+                    return;
+                };
+                let at = snap(pos);
+                match self.art_shape {
+                    DrawShape::Words => {
+                        let text = self.art_text.trim().to_owned();
+                        if text.is_empty() {
+                            self.message = t!("board.canvas_click.type_the_words_to_print");
+                        } else {
+                            self.run(
+                                "board.layer_text_add",
+                                json!({"layer": layer, "x": at.x, "y": at.y, "text": text}),
+                            );
+                        }
+                    }
+                    DrawShape::Poly => {
+                        let closing = self
+                            .art_points
+                            .first()
+                            .is_some_and(|first| pos.distance(*first) < 6.0 / zoom as f64);
+                        if closing && self.art_points.len() >= 3 {
+                            self.commit_poly(layer);
+                        } else if self.art_points.len() >= 64 {
+                            self.message = t!("board.canvas_click.an_outline_holds_up_to");
+                        } else {
+                            self.art_points.push(pos);
+                        }
+                    }
+                    _ => match self.art_start {
+                        None => self.art_start = Some(pos),
+                        Some(start) => {
+                            let start = snap(start);
+                            match self.art_shape {
+                                DrawShape::Line => self.run(
+                                    "board.layer_line_add",
+                                    json!({
+                                        "layer": layer,
+                                        "x1": start.x,
+                                        "y1": start.y,
+                                        "x2": at.x,
+                                        "y2": at.y,
+                                    }),
+                                ),
+                                DrawShape::Rect => self.run(
+                                    "board.layer_rect_add",
+                                    json!({
+                                        "layer": layer,
+                                        "x": start.x.min(at.x),
+                                        "y": start.y.min(at.y),
+                                        "width": (at.x - start.x).abs(),
+                                        "height": (at.y - start.y).abs(),
+                                    }),
+                                ),
+                                _ => self.run(
+                                    "board.layer_circle_add",
+                                    json!({
+                                        "layer": layer,
+                                        "x": start.x,
+                                        "y": start.y,
+                                        "radius": start.distance(at),
+                                    }),
+                                ),
+                            }
+                            self.art_start = None;
+                        }
+                    },
+                }
+            }
         }
     }
     fn path(
@@ -589,7 +1836,9 @@ impl App {
         ));
     }
     fn paint_schematic(&self, painter: &egui::Painter, rect: Rect, camera: Camera, p: &Project) {
-        for w in &p.wires {
+        let shown = |name: &str| self.layer_shown(name);
+        underlay::paint(painter, rect, camera, p, "schematic");
+        for w in p.wires.iter().filter(|_| shown("Wires")) {
             if let Some(path) = p.wire_path(w) {
                 painter.add(egui::Shape::line(
                     path.iter()
@@ -619,7 +1868,87 @@ impl App {
                 );
             }
         }
-        for c in p.components.iter().flat_map(|c| c.schematic_views()) {
+        for w in p.drawn_wires.iter().filter(|_| shown("Wires")) {
+            painter.add(egui::Shape::line(
+                w.points
+                    .iter()
+                    .map(|point| camera.screen(*point, rect))
+                    .collect(),
+                Stroke::new(1.8, self.accent()),
+            ));
+        }
+        for g in p
+            .graphics
+            .iter()
+            .filter(|g| g.layer == "schematic" && shown("Graphics"))
+        {
+            if let Some(outline) = g.outline() {
+                painter.add(egui::Shape::line(
+                    outline
+                        .iter()
+                        .map(|point| camera.screen(*point, rect))
+                        .collect(),
+                    Stroke::new(1.6, self.accent()),
+                ));
+            } else if let Some(anchor) = g.points.first() {
+                painter.text(
+                    camera.screen(*anchor, rect),
+                    Align2::LEFT_TOP,
+                    &g.text,
+                    FontId::proportional(g.width as f32),
+                    self.accent(),
+                );
+            }
+        }
+        for l in p.labels.iter().filter(|_| shown("Net labels")) {
+            let at = camera.screen(l.position, rect);
+            if l.kind == "junction" {
+                painter.circle_filled(at, 3.0, self.accent());
+            } else {
+                let text = match l.kind.as_str() {
+                    "global" => format!("{{{}}}", p.net_name(l.net)),
+                    "hierarchical" => format!("/{}", p.net_name(l.net)),
+                    "bus" => l.text.clone(),
+                    _ => p.net_name(l.net).to_string(),
+                };
+                painter.text(
+                    at,
+                    Align2::CENTER_BOTTOM,
+                    text,
+                    FontId::monospace(11.0),
+                    self.accent(),
+                );
+            }
+        }
+        for port in &p.ports {
+            let at = camera.screen(port.position, rect);
+            painter.text(
+                at,
+                Align2::CENTER_CENTER,
+                format!("[{}]", port.name),
+                FontId::monospace(11.0),
+                self.accent(),
+            );
+        }
+        for f in &p.no_connects {
+            if let Some(anchor) = p.pin_position(&f.pin) {
+                let at = camera.screen(anchor, rect);
+                painter.line_segment(
+                    [at + egui::vec2(-4.0, -4.0), at + egui::vec2(4.0, 4.0)],
+                    Stroke::new(1.6, self.colours().canvas.front),
+                );
+                painter.line_segment(
+                    [at + egui::vec2(-4.0, 4.0), at + egui::vec2(4.0, -4.0)],
+                    Stroke::new(1.6, self.colours().canvas.front),
+                );
+            }
+        }
+        for c in p
+            .components
+            .iter()
+            .flat_map(|c| c.schematic_views())
+            .filter(|_| shown("Symbols"))
+        {
             self.symbol(
                 painter,
                 rect,
@@ -634,14 +1963,14 @@ impl App {
             painter.text(
                 rect.center() - Vec2::new(0.0, 25.0),
                 Align2::CENTER_CENTER,
-                "Start your circuit",
+                t!("schematic.paint_schematic.start_your_circuit"),
                 FontId::proportional(28.0),
                 self.ink(),
             );
             painter.text(
                 rect.center() + Vec2::new(0.0, 20.0),
                 Align2::CENTER_CENTER,
-                "Press A to add a symbol, or load the LED example below",
+                t!("schematic.paint_schematic.press_a_to_add_a"),
                 FontId::proportional(14.0),
                 self.muted(),
             );
@@ -692,14 +2021,35 @@ impl App {
             for pin in library.definition.pins.iter().filter(|p| {
                 (p.unit == 0 && library.unit == 1 || p.unit == library.unit) && p.body_style <= 1
             }) {
-                let end = pin.position.offset(Point::new(
-                    pin.length * pin.angle.to_radians().cos(),
-                    -pin.length * pin.angle.to_radians().sin(),
-                ));
-                painter.line_segment([at(pin.position), at(end)], stroke);
+                if pin.visible {
+                    let end = pin.stem_end();
+                    painter.line_segment([at(pin.position), at(end)], stroke);
+                    for (center, radius) in pin.decoration_bubbles() {
+                        painter.circle_stroke(
+                            at(center),
+                            (radius * f64::from(camera.zoom)) as f32,
+                            stroke,
+                        );
+                    }
+                    for path in pin.decoration_paths() {
+                        if path.len() >= 3 {
+                            painter.add(egui::Shape::closed_line(
+                                path.iter().map(|p| at(*p)).collect(),
+                                stroke,
+                            ));
+                        } else if path.len() == 2 {
+                            painter.line_segment([at(path[0]), at(path[1])], stroke);
+                        }
+                    }
+                }
                 if pin.name != "~" && !pin.name.is_empty() {
+                    let label_at = if pin.visible {
+                        pin.stem_end()
+                    } else {
+                        pin.position
+                    };
                     painter.text(
-                        at(end) + Vec2::new(3.0, -3.0),
+                        at(label_at) + Vec2::new(3.0, -3.0),
                         Align2::LEFT_BOTTOM,
                         &pin.name,
                         FontId::monospace(10.0),
@@ -815,26 +2165,56 @@ impl App {
         }
     }
     fn paint_board(&self, painter: &egui::Painter, rect: Rect, camera: Camera, p: &Project) {
+        let shown = |name: &str| self.layer_shown(name);
         let board = Rect::from_two_pos(
             camera.screen(Point::default(), rect),
             camera.screen(Point::new(p.board.width, p.board.height), rect),
         );
-        painter.rect_filled(
-            board,
-            0.0,
-            if self.preferences.dark {
-                Color32::from_rgb(21, 54, 49)
-            } else {
-                Color32::from_rgb(205, 233, 222)
-            },
-        );
+        painter.rect_filled(board, 0.0, self.colours().canvas.board);
+        underlay::paint(painter, rect, camera, p, "pcb");
         painter.rect_stroke(
             board,
             0.0,
             Stroke::new(1.5, self.accent()),
             egui::StrokeKind::Inside,
         );
-        for c in &p.board.cutouts {
+        for fid in &p.board.fiducials {
+            let center = camera.screen(fid.position, rect);
+            let radius = ((fid.diameter / 2.0) as f32 * camera.zoom).max(1.5);
+            let color = if fid.layer == Layer::Front {
+                self.colours().canvas.front
+            } else {
+                self.colours().canvas.back
+            };
+            painter.circle_filled(center, radius, color);
+            painter.circle_stroke(center, radius, Stroke::new(1.0, self.ink()));
+        }
+        for h in &p.board.holes {
+            let radius = ((h.diameter / 2.0) as f32 * camera.zoom).max(1.5);
+            if h.is_slot() {
+                // A slot is a capsule: a line of the drill width between its
+                // two centres, capped with half circles at each end.
+                let a = camera.screen(h.start(), rect);
+                let b = camera.screen(h.finish(), rect);
+                let dir = (b - a).normalized();
+                let side = egui::vec2(-dir.y, dir.x) * radius;
+                let (a2, b2) = (a + dir * radius, b - dir * radius);
+                painter.line_segment([a, b], Stroke::new(radius * 2.0, self.surface()));
+                painter.circle_filled(a, radius, self.surface());
+                painter.circle_filled(b, radius, self.surface());
+                let ink = Stroke::new(1.0, self.ink());
+                painter.line_segment([a2 + side, b2 + side], ink);
+                painter.line_segment([a2 - side, b2 - side], ink);
+                painter.circle_stroke(a, radius, ink);
+                painter.circle_stroke(b, radius, ink);
+            } else {
+                let center = camera.screen(h.position, rect);
+                painter.circle_filled(center, radius, self.surface());
+                painter.circle_stroke(center, radius, Stroke::new(1.0, self.ink()));
+            }
+        }
+        self.paint_datums(painter, rect, camera, p);
+        for c in p.board.cutouts.iter().filter(|_| shown("Cutouts")) {
             let center = camera.screen(c.center, rect);
             painter.circle_filled(center, c.radius as f32 * camera.zoom, self.surface());
             painter.circle_stroke(
@@ -853,12 +2233,60 @@ impl App {
                 ) {
                     painter.line_segment(
                         [camera.screen(a, rect), camera.screen(b, rect)],
-                        Stroke::new(1.0, Color32::from_rgb(126, 153, 161)),
+                        Stroke::new(1.0, self.colours().canvas.wire),
                     );
                 }
             }
         }
-        for t in &p.board.tracks {
+        for z in p.board.zones.iter().filter(|_| shown("Copper zones")) {
+            let screen: Vec<egui::Pos2> = z
+                .outline
+                .iter()
+                .map(|pt| camera.screen(*pt, rect))
+                .collect();
+            let zone_colour = if z.layer == Layer::Front {
+                self.colours().canvas.front
+            } else {
+                self.colours().canvas.back
+            };
+            let rgb = [zone_colour.r(), zone_colour.g(), zone_colour.b()];
+            let fill = if self.selected == Some(z.id) {
+                self.accent().linear_multiply(0.35)
+            } else {
+                Color32::from_rgb(rgb[0], rgb[1], rgb[2]).linear_multiply(0.3)
+            };
+            if z.filled || self.selected == Some(z.id) {
+                painter.add(egui::Shape::convex_polygon(
+                    screen.clone(),
+                    fill,
+                    Stroke::NONE,
+                ));
+            }
+            painter.add(egui::Shape::closed_line(
+                screen.clone(),
+                Stroke::new(1.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2])),
+            ));
+            for cut in &z.cutouts {
+                let cut_screen: Vec<egui::Pos2> =
+                    cut.iter().map(|pt| camera.screen(*pt, rect)).collect();
+                painter.add(egui::Shape::convex_polygon(
+                    cut_screen.clone(),
+                    Color32::from_rgb(25, 58, 54),
+                    Stroke::NONE,
+                ));
+                painter.add(egui::Shape::closed_line(
+                    cut_screen,
+                    Stroke::new(1.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2])),
+                ));
+            }
+        }
+        for t in p.board.tracks.iter().filter(|t| {
+            shown(if t.layer == pcbcraft_doc::Layer::Front {
+                "Top copper"
+            } else {
+                "Bottom copper"
+            })
+        }) {
             painter.line_segment(
                 [camera.screen(t.start, rect), camera.screen(t.end, rect)],
                 Stroke::new(
@@ -866,12 +2294,56 @@ impl App {
                     if self.selected == Some(t.id) {
                         self.accent()
                     } else if t.layer == Layer::Front {
-                        Color32::from_rgb(245, 141, 121)
+                        self.copper(Some(t.net), self.colours().canvas.front)
                     } else {
-                        Color32::from_rgb(116, 167, 236)
+                        self.copper(Some(t.net), self.colours().canvas.back)
                     },
                 ),
             );
+        }
+        for v in p.board.vias.iter().filter(|_| shown("Vias")) {
+            let at = camera.screen(v.position, rect);
+            let radius = (v.diameter as f32 / 2.0 * camera.zoom).max(2.0);
+            let base = if self.selected == Some(v.id) {
+                self.accent()
+            } else {
+                self.copper(Some(v.net), self.colours().canvas.front)
+            };
+            if via_on_layer(p, v, self.route_layer) {
+                painter.circle_filled(at, radius, base);
+            } else {
+                // The via has no copper on the active layer: show a faint ring
+                // so it is still found, without looking like copper here.
+                painter.circle_stroke(at, radius, Stroke::new(1.0, base.linear_multiply(0.35)));
+            }
+            if v.drill > 0.0 && via_on_layer(p, v, self.route_layer) {
+                painter.circle_filled(
+                    at,
+                    (v.drill as f32 / 2.0 * camera.zoom).max(1.0),
+                    Color32::from_rgb(19, 28, 41),
+                );
+            }
+        }
+        for t in &p.board.netties {
+            let half = t.diameter / 2.0;
+            let axis = pcbcraft_geom::Point::new(half, 0.0).rotate(t.rotation);
+            for sign in [1.0, -1.0] {
+                let centre = t
+                    .position
+                    .offset(pcbcraft_geom::Point::new(axis.x * sign, axis.y * sign));
+                painter.circle_stroke(
+                    camera.screen(centre, rect),
+                    (half as f32 * camera.zoom).max(2.0),
+                    Stroke::new(
+                        1.5,
+                        if self.selected == Some(t.id) {
+                            self.accent()
+                        } else {
+                            self.colours().canvas.net_tie
+                        },
+                    ),
+                );
+            }
         }
         for f in &p.board.footprints {
             let points = f
@@ -909,7 +2381,12 @@ impl App {
                 .component(f.component)
                 .and_then(|c| c.library_footprint.as_ref())
             {
-                for g in &library.definition.graphics {
+                for g in library
+                    .definition
+                    .graphics
+                    .iter()
+                    .filter(|_| shown("Package artwork"))
+                {
                     if matches!(g,pcbcraft_library::Graphic::Text {text,..} if text=="REF**" || text=="%R" || text=="${REFERENCE}" || text=="${VALUE}" || text==&library.definition.name)
                     {
                         continue;
@@ -927,17 +2404,23 @@ impl App {
                     Stroke::new(1.0, color),
                 ));
             }
-            for pad in &f.pads {
-                if let Some(pos) = f.pad_position(&pad.number) {
+            for pad in f.pads.iter().filter(|_| shown("Pads")) {
+                {
+                    let pos = f.pad_world_position(pad);
                     let center = camera.screen(pos, rect);
-                    painter.add(egui::Shape::convex_polygon(
-                        pad.outline_points()
+                    let mechanical = is_mechanical_pad(pad);
+                    if !mechanical {
+                        let outline: Vec<Pos2> = pad
+                            .outline_points()
                             .into_iter()
                             .map(|p| camera.screen(f.position.offset(p.rotate(-f.rotation)), rect))
-                            .collect(),
-                        Color32::from_rgb(230, 194, 125),
-                        Stroke::NONE,
-                    ));
+                            .collect();
+                        painter.add(pad_shape(
+                            outline,
+                            pad.outline_is_convex(),
+                            self.copper(pad.net, self.colours().canvas.pad),
+                        ));
+                    }
                     let hole = pad.drill_outline_points();
                     if !hole.is_empty() {
                         painter.add(egui::Shape::convex_polygon(
@@ -947,20 +2430,32 @@ impl App {
                                 })
                                 .collect(),
                             self.surface(),
-                            Stroke::NONE,
+                            if mechanical {
+                                Stroke::new(1.0, color)
+                            } else {
+                                Stroke::NONE
+                            },
                         ));
                     }
-                    painter.text(
-                        center,
-                        Align2::CENTER_CENTER,
-                        &pad.number,
-                        FontId::monospace(10.0),
-                        if pad.geometry.as_ref().is_some_and(|g| g.drill.is_some()) {
-                            Color32::from_rgb(230, 194, 125)
-                        } else {
-                            Color32::from_rgb(48, 44, 32)
-                        },
-                    );
+                    if self.preferences.pad_labels != PadLabels::Off {
+                        let label = match self.preferences.pad_labels {
+                            PadLabels::Net => p.net_name(pad.net.unwrap_or_default()).to_string(),
+                            _ => pad.number.clone(),
+                        };
+                        if !label.is_empty() {
+                            painter.text(
+                                center,
+                                Align2::CENTER_CENTER,
+                                label,
+                                FontId::monospace(10.0),
+                                if pad.geometry.as_ref().is_some_and(|g| g.drill.is_some()) {
+                                    self.colours().canvas.pad_label_hole
+                                } else {
+                                    self.colours().canvas.pad_label_smd
+                                },
+                            );
+                        }
+                    }
                 }
             }
             if let Some(c) = p.component(f.component) {
@@ -980,17 +2475,79 @@ impl App {
                 );
             }
         }
+        for t in &p.board.texts {
+            let at = camera.screen(t.position, rect);
+            let color = if t.layer == pcbcraft_doc::Layer::Front {
+                self.ink()
+            } else {
+                self.ink().gamma_multiply(0.75)
+            };
+            painter.text(
+                at,
+                Align2::LEFT_BOTTOM,
+                &t.text,
+                FontId::proportional((t.size as f32 * camera.zoom).max(1.0)),
+                color,
+            );
+        }
+        self.draw_user_layers(painter, rect, camera, p);
+        self.paint_board_graphics(painter, rect, camera, p);
         painter.text(
             board.left_bottom() + Vec2::new(0.0, 18.0),
             Align2::LEFT_TOP,
-            format!(
-                "{} × {} mm    F.Cu / B.Cu    clearance {} mm",
-                p.board.width, p.board.height, p.board.clearance
+            t!(
+                "board.paint_board.width_height_mm_top_bottom",
+                width = p.board.width,
+                height = p.board.height,
+                clearance = p.board.clearance
             ),
             FontId::monospace(11.0),
             self.muted(),
         );
     }
+}
+
+/// Filled pad copper. Convex outlines use egui's convex fill; custom polygon
+/// pads may be concave, so they are ear-clip triangulated into a mesh.
+fn pad_shape(mut outline: Vec<Pos2>, convex: bool, color: Color32) -> egui::Shape {
+    if !convex {
+        if outline.len() > 1 && outline.first() == outline.last() {
+            outline.pop();
+        }
+        let points: Vec<Point> = outline
+            .iter()
+            .map(|p| Point::new(p.x as f64, p.y as f64))
+            .collect();
+        let triangles = pcbcraft_geom::triangulate(&points);
+        if !triangles.is_empty() {
+            let mut mesh = egui::Mesh::default();
+            for p in &outline {
+                mesh.colored_vertex(*p, color);
+            }
+            for [a, b, c] in triangles {
+                mesh.add_triangle(a as u32, b as u32, c as u32);
+            }
+            return egui::Shape::mesh(mesh);
+        }
+    }
+    egui::Shape::convex_polygon(outline, color, Stroke::NONE)
+}
+
+/// Whether a via has copper on the layer being worked on. The "Bottom" choice
+/// always means the last copper layer of the board.
+pub(crate) fn via_on_layer(
+    p: &pcbcraft_doc::Project,
+    v: &pcbcraft_doc::Via,
+    active: pcbcraft_doc::Layer,
+) -> bool {
+    let last = p.copper_layer_count().saturating_sub(1);
+    let index = if active == Layer::Back {
+        last
+    } else {
+        active.index()
+    };
+    let (a, b) = p.via_span(v);
+    (a.index()..=b.index()).contains(&index)
 }
 
 #[cfg(test)]
@@ -1065,4 +2622,186 @@ mod library_render_tests {
                 .any(|s| matches!(&s.shape,egui::Shape::Path(p) if p.fill==Color32::WHITE))
         );
     }
+    #[test]
+    fn pad_display_mode_switches_between_number_net_and_nothing() -> Result<(), String> {
+        let mut project = pcbcraft_doc::Project::default();
+        project.nets.push(pcbcraft_doc::Net {
+            id: 3,
+            name: "SPOT".into(),
+            ..Default::default()
+        });
+        project.components.push(pcbcraft_doc::Component {
+            sheet: 0,
+            id: 1,
+            reference: "ZZ8".into(),
+            value: "9".into(),
+            kind: "resistor".into(),
+            position: Point::new(5.0, 5.0),
+            rotation: 0.0,
+            pins: vec![],
+            units: vec![],
+            library_symbol: None,
+            library_footprint: None,
+            fields: vec![],
+        });
+        project.board.footprints.push(pcbcraft_doc::Footprint {
+            id: 2,
+            component: 1,
+            position: Point::new(5.0, 5.0),
+            rotation: 0.0,
+            locked: None,
+            pads: vec![pcbcraft_doc::Pad {
+                number: "7".into(),
+                offset: Point::new(1.0, 0.0),
+                diameter: 1.5,
+                net: Some(3),
+                castellated: None,
+                geometry: None,
+            }],
+        });
+        let shared = pcbcraft_mcp::shared(pcbcraft_engine::Session::default());
+        let mut app = App::create(shared, Preferences::default(), None, None);
+        let labels = |app: &App| -> Vec<String> {
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    app.paint_board(
+                        ui.painter(),
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(500.0, 500.0)),
+                        Camera {
+                            center: Point::default(),
+                            zoom: 20.0,
+                        },
+                        &project,
+                    );
+                });
+            });
+            output.textures_delta.clear();
+            output
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            app.preferences.pad_labels,
+            PadLabels::Number,
+            "pad numbers are the default display mode"
+        );
+        let numbers = labels(&app);
+        assert!(
+            numbers.iter().any(|t| t == "7"),
+            "pad numbers show in number mode: {numbers:?}"
+        );
+        assert!(
+            !numbers.iter().any(|t| t == "SPOT"),
+            "nets stay hidden in number mode"
+        );
+        app.preferences.pad_labels = PadLabels::Net;
+        let nets = labels(&app);
+        assert!(
+            nets.iter().any(|t| t == "SPOT"),
+            "net mode names the net sitting on the pad: {nets:?}"
+        );
+        assert!(!nets.iter().any(|t| t == "7"), "pad numbers step aside");
+        app.preferences.pad_labels = PadLabels::Off;
+        let bare = labels(&app);
+        assert!(!bare.iter().any(|t| t == "7"), "off hides pad labels");
+        assert!(
+            bare.iter().any(|t| t == "ZZ8"),
+            "the reference label stays in every mode"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_view_frames_the_whole_board_instead_of_a_corner_of_it() -> Result<(), String> {
+        let mut s = pcbcraft_engine::Session::default();
+        let bounds = view_bounds(&s.project, true);
+        let camera = fit_camera(bounds.0, bounds.1, (1200.0, 700.0));
+        assert!(
+            camera.zoom > 1.0,
+            "a default board fills the panel, not 60 px of it"
+        );
+        assert_eq!(camera.center, Point::new(30.0, 20.0), "the board centres");
+        s.execute(
+            "board.set_outline",
+            serde_json::json!({"points":[{"x":0.0,"y":0.0},{"x":300.0,"y":0.0},{"x":300.0,"y":200.0},{"x":0.0,"y":200.0}]}),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        let (lo, hi) = view_bounds(&s.project, true);
+        assert!(hi.x > 290.0, "the outline drives the frame");
+        let camera = fit_camera(lo, hi, (1200.0, 700.0));
+        assert!(camera.zoom < 6.0, "a big board zooms out to fit");
+        assert!(camera.zoom >= 0.02, "zoom stays bounded");
+        let mut empty = pcbcraft_engine::Session::default();
+        let (lo, hi) = view_bounds(&empty.project, false);
+        assert!(hi.x > lo.x, "an empty sheet still has a frame");
+        empty
+            .execute(
+                "component.add",
+                serde_json::json!({"kind":"resistor","position":{"x":120.0,"y":60.0}}),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        let (_lo, hi) = view_bounds(&empty.project, false);
+        assert!(hi.x > 110.0, "the schematic frame follows the drawn parts");
+        Ok(())
+    }
+
+    #[test]
+    fn the_net_spotlight_lights_one_net_and_fades_the_rest() {
+        let copper = Color32::from_rgb(245, 141, 121);
+        let hot = Color32::from_rgb(255, 200, 0);
+        assert_eq!(
+            spotlight(None, Some(4), copper, hot),
+            copper,
+            "with no spotlight every net keeps its own colour"
+        );
+        assert_eq!(
+            spotlight(Some(4), Some(4), copper, hot),
+            hot,
+            "the lit net glows in the accent colour"
+        );
+        let faded = spotlight(Some(4), Some(9), copper, hot);
+        assert_ne!(faded, copper);
+        assert!(
+            faded.gamma_multiply(4.0) != copper,
+            "other copper is dimmed, not recoloured"
+        );
+        assert_eq!(
+            spotlight(Some(4), None, copper, hot),
+            copper.gamma_multiply(0.25),
+            "copper without a net fades while a net is lit"
+        );
+    }
+}
+
+/// Shortest distance from a point to a straight segment, in millimetres.
+fn segment_distance(point: Point, from: Point, to: Point) -> f64 {
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
+    let span = dx * dx + dy * dy;
+    if span < 1e-12 {
+        return point.distance(from);
+    }
+    let along = ((point.x - from.x) * dx + (point.y - from.y) * dy) / span;
+    let along = along.clamp(0.0, 1.0);
+    point.distance(Point::new(from.x + dx * along, from.y + dy * along))
+}
+
+/// True for a bare drilled hole inside a footprint: no copper, no net.
+pub(crate) fn is_mechanical_pad(pad: &pcbcraft_doc::Pad) -> bool {
+    pad.geometry
+        .as_ref()
+        .is_some_and(|g| g.pad_type == "unplated")
 }
