@@ -157,3 +157,139 @@ fn inheritance_overrides_properties_and_replaces_local_units()
     assert!(read_symbols("(kicad_symbol_lib (symbol X (symbol X_1_1) (symbol X_1_1)))").is_err());
     Ok(())
 }
+
+#[test]
+fn footprint_models_are_recorded_and_bounded() -> Result<(), Box<dyn std::error::Error>> {
+    let fp = read_footprint(
+        "(footprint M (at 0 0 0) (layer F.Cu)\
+         (model \"pkg.wrl\" (offset (xyz 0 0 1)) (scale (xyz 2 2 2)) (rotate (xyz 0 0 90)))\
+         (pad 1 smd circle (at 0 0) (size 1 1) (layers F.Cu)))",
+    )?;
+    let m = fp.model.as_ref().ok_or("model missing")?;
+    assert_eq!(m.path, "pkg.wrl");
+    assert_eq!(m.offset, [0.0, 0.0, 1.0]);
+    assert_eq!(m.scale, [2.0, 2.0, 2.0]);
+    assert_eq!(m.rotate, [0.0, 0.0, 90.0]);
+    assert!(
+        fp.unsupported.iter().all(|u| !u.contains("model")),
+        "a recorded model is no longer unsupported"
+    );
+    let modern = read_footprint(
+        "(footprint M (at 0 0 0) (layer F.Cu)\
+         (model \"pkg.step\" (at (xyz 1 2 3)) (rotate (xyz 0 90 0)))\
+         (pad 1 smd circle (at 0 0) (size 1 1) (layers F.Cu)))",
+    )?;
+    let m = modern.model.as_ref().ok_or("at-form model missing")?;
+    assert_eq!(m.offset, [1.0, 2.0, 3.0], "newer files place with at");
+    assert_eq!(m.scale, [1.0, 1.0, 1.0], "an absent scale is unit size");
+    let plain = read_footprint(
+        "(footprint M (at 0 0 0) (layer F.Cu) (model \"pkg.wrl\")\
+         (pad 1 smd circle (at 0 0) (size 1 1) (layers F.Cu)))",
+    )?;
+    let m = plain.model.as_ref().ok_or("bare model missing")?;
+    assert_eq!(m.offset, [0.0, 0.0, 0.0]);
+    assert!(
+        read_footprint(
+            "(footprint M (at 0 0 0) (layer F.Cu) (model \"a.wrl\" (offset (xyz 0 0 NaN))))"
+        )
+        .is_err(),
+        "a non-finite model offset is rejected"
+    );
+    assert!(
+        read_footprint(
+            "(footprint M (at 0 0 0) (layer F.Cu) (model \"a.wrl\" (scale (xyz 1 0 1))))"
+        )
+        .is_err(),
+        "a zero model scale is rejected"
+    );
+    assert!(
+        read_footprint("(footprint M (at 0 0 0) (layer F.Cu) (model \"\"))").is_err(),
+        "an empty model path is rejected"
+    );
+    let doubled = read_footprint(
+        "(footprint M (at 0 0 0) (layer F.Cu) (model \"a.wrl\") (model \"b.wrl\"))",
+    )?;
+    assert_eq!(
+        doubled.model.as_ref().ok_or("first model missing")?.path,
+        "a.wrl",
+        "the first model wins"
+    );
+    assert!(
+        doubled
+            .unsupported
+            .iter()
+            .any(|u| u.contains("more than one 3D model")),
+        "extra models are reported"
+    );
+    Ok(())
+}
+
+#[test]
+fn specctra_session_net_maps_are_split_bounded_and_skipped_when_empty()
+-> Result<(), Box<dyn std::error::Error>> {
+    let session = r#"(session
+        (parser
+            (library 0)
+        )
+        (net_map_out
+            (net
+                (number 0)
+                (name UNCONNECTED)
+            )
+            (net
+                (number 1)
+                (name GND)
+                (pins
+                    (pin R1-1)
+                    (pin C1-2)
+                    (pin J1-A)
+                )
+            )
+            (net
+                (number 2)
+                (name "5V")
+                (pins
+                    (pin U1-8)
+                    (pin C1-1)
+                )
+            )
+        )
+    )"#;
+    let nets = pcbcraft_library::read_specctra_session(session)?;
+    assert_eq!(nets.len(), 2, "the pin-less net is skipped");
+    assert_eq!(nets[0].name, "GND");
+    assert_eq!(nets[0].pins[0], ("R1".into(), "1".into()));
+    assert_eq!(
+        nets[0].pins[2],
+        ("J1".into(), "A".into()),
+        "lettered pins split at the last dash"
+    );
+    assert_eq!(nets[1].name, "5V", "quoted names are unquoted");
+    assert_eq!(nets[1].pins[1], ("C1".into(), "1".into()));
+    assert!(pcbcraft_library::read_specctra_session("(board X)").is_err());
+    assert!(pcbcraft_library::read_specctra_session("(session (parser (library 0)))").is_err());
+    assert!(
+        pcbcraft_library::read_specctra_session(
+            "(session (net_map_out (net (name GND) (pins (pin R1)))))"
+        )
+        .is_err(),
+        "a pin without a dash is refused"
+    );
+    assert!(
+        pcbcraft_library::read_specctra_session(
+            "(session (net_map_out (net (name \"\") (pins (pin R1-1)))))"
+        )
+        .is_err(),
+        "an empty net name is refused"
+    );
+    let many = (0..257)
+        .map(|i| format!("(net (number {i}) (name N{i}) (pins (pin R1-1)))"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        pcbcraft_library::read_specctra_session(&format!("(session (net_map_out {many}))"))
+            .is_err(),
+        "more than 256 nets are refused"
+    );
+    Ok(())
+}
