@@ -9,9 +9,13 @@ rust-version.workspace = true
 workspace = true
 
 [dev-dependencies]
-pcbcraft-library.workspace = true
+serde_json.workspace = true
 
 [dependencies]
+pcbcraft-calc = { path = "../calc" }
 pcbcraft-geom.workspace = true
 pcbcraft-doc.workspace = true
+pcbcraft-library.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true

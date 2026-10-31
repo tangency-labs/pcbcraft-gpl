@@ -1,4 +1,11 @@
 //! Native library discovery and cached read queries, separate from document mutation.
+//!
+//! `library.list` filters part listings with one `PartFilter` and pages them
+//! grouped by source; it never merges sources by rank and never mutates.
+//! Dependencies: `crates/library/src/listing.rs` for `PartListing` and `PartFilter`;
+//! `crates/library/src/listing_adapters.rs` for the symbol adapters.
+use pcbcraft_library::listing::{ListingSource, PartFilter, PartListing};
+use pcbcraft_library::listing_adapters::listings_from_symbols;
 use pcbcraft_library::{FootprintDefinition, SymbolDefinition};
 use serde_json::{Value, json};
 use std::io::Read;
@@ -112,7 +119,269 @@ pub fn footprint(path: &Path) -> Result<FootprintDefinition, String> {
     }
     pcbcraft_library::read_footprint(&read_library(path)?).map_err(|e| e.to_string())
 }
+/// A named folder the user registered so its symbol and footprint collections
+/// join the one library the browser shows, no matter where they live.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct LibrarySource {
+    pub name: String,
+    pub path: String,
+    /// When set, marks this registered folder as the personal or shared library target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+const MAX_LIBRARY_SOURCES: usize = 64;
+pub static SOURCES_PATH_TEST: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// Held by any test that redirects the sources file, so two never
+/// race over the shared slot.
+pub static SOURCES_TEST_LOCK: Mutex<()> = Mutex::new(());
+fn sources_path() -> Result<PathBuf, String> {
+    if let Some(path) = SOURCES_PATH_TEST
+        .lock()
+        .ok()
+        .and_then(|locked| locked.as_ref().cloned())
+    {
+        return Ok(path);
+    }
+    let directory = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    directory("XDG_CONFIG_HOME")
+        .or_else(|| directory("APPDATA"))
+        .or_else(|| directory("HOME").map(|home| home.join(".config")))
+        .map(|base| base.join("pcbcraft").join("library-sources.json"))
+        .ok_or_else(|| "no user configuration folder was found".into())
+}
+fn usable_source(source: &LibrarySource) -> bool {
+    !source.name.trim().is_empty()
+        && source.name.chars().count() <= 64
+        && !source.path.trim().is_empty()
+        && source.path.chars().count() <= 1024
+        && std::fs::metadata(&source.path).is_ok_and(|metadata| metadata.is_dir())
+}
+fn load_sources() -> Vec<LibrarySource> {
+    let Ok(path) = sources_path() else {
+        return vec![];
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return vec![];
+    };
+    serde_json::from_str::<Vec<LibrarySource>>(&text)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(usable_source)
+        .take(MAX_LIBRARY_SOURCES)
+        .collect()
+}
+fn same_folder(left: &Path, right: &Path) -> bool {
+    left.canonicalize().unwrap_or_else(|_| left.to_path_buf())
+        == right.canonicalize().unwrap_or_else(|_| right.to_path_buf())
+}
+/// Which named source a scanned root belongs to, so the unified list can say
+/// where every collection came from.
+fn source_label(root: &Path) -> String {
+    if let Some(source) = load_sources()
+        .into_iter()
+        .find(|source| same_folder(Path::new(&source.path), root))
+    {
+        return source.name;
+    }
+    if built_in_roots()
+        .iter()
+        .any(|installed| same_folder(installed, root))
+    {
+        return "Installed collections".into();
+    }
+    "Other libraries".into()
+}
+fn write_sources(sources: &[LibrarySource]) -> Result<(), String> {
+    let file = sources_path()?;
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    pcbcraft_io::atomic_write(
+        &file,
+        serde_json::to_string_pretty(sources)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )
+}
+fn counts(root: &Path) -> Result<(usize, usize), String> {
+    let scanned = catalog_paths(vec![root.to_path_buf()], 200)?;
+    Ok((
+        scanned["symbol_libraries"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+        scanned["footprint_libraries"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+    ))
+}
+/// Register any folder on this computer as a library source; its collections
+/// join every other collection in the unified browser on the next scan.
+pub fn add_folder(path: &str, name: Option<&str>) -> Result<Value, String> {
+    let path = path.trim();
+    if path.is_empty() || path.chars().count() > 1024 {
+        return Err("provide the full path to a library folder".into());
+    }
+    let folder = PathBuf::from(path);
+    if !std::fs::metadata(&folder).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err("choose a folder that exists on this computer".into());
+    }
+    let canonical = folder
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", folder.display()))?;
+    let name = name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            canonical
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Library folder")
+                .replace(['_', '-'], " ")
+        });
+    if name.chars().count() > 64 {
+        return Err("source names must be 64 characters or fewer".into());
+    }
+    let mut sources = load_sources();
+    if sources.len() >= MAX_LIBRARY_SOURCES {
+        return Err("library sources are limited to 64 folders".into());
+    }
+    if sources
+        .iter()
+        .any(|source| same_folder(Path::new(&source.path), &canonical))
+    {
+        return Err("that folder is already one of the library sources".into());
+    }
+    let (symbols, footprints) = counts(&canonical)?;
+    sources.push(LibrarySource {
+        name: name.clone(),
+        path: canonical.to_string_lossy().into_owned(),
+        role: None,
+    });
+    write_sources(&sources)?;
+    Ok(json!({
+        "added": name,
+        "path": canonical.to_string_lossy(),
+        "symbol_libraries": symbols,
+        "footprint_libraries": footprints,
+        "sources": self::sources()?["sources"].clone(),
+    }))
+}
+/// Forget an added folder; the installed locations are never removed.
+fn valid_role(role: &str) -> Result<(), String> {
+    match role {
+        "personal" | "shared" => Ok(()),
+        _ => Err("role must be personal or shared".into()),
+    }
+}
+
+/// Point a registered library folder at the personal or shared save target.
+pub fn set_source_role(path: &str, role: Option<&str>) -> Result<Value, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("provide the folder path to mark".into());
+    }
+    if let Some(role) = role {
+        valid_role(role)?;
+    }
+    let target = PathBuf::from(path);
+    let mut sources = load_sources();
+    let mut found = false;
+    for source in &mut sources {
+        if same_folder(Path::new(&source.path), &target) {
+            found = true;
+            source.role = role.map(str::to_owned);
+        } else if let Some(role) = role {
+            if source.role.as_deref() == Some(role) {
+                source.role = None;
+            }
+        }
+    }
+    if !found {
+        return Err("register that folder as a library source before marking its role".into());
+    }
+    write_sources(&sources)?;
+    Ok(json!({"path": path, "role": role, "sources": self::sources()?["sources"].clone()}))
+}
+
+pub fn folder_for_role(role: &str) -> Result<PathBuf, String> {
+    valid_role(role)?;
+    load_sources()
+        .into_iter()
+        .find(|source| source.role.as_deref() == Some(role))
+        .map(|source| PathBuf::from(source.path))
+        .ok_or_else(|| format!("no library source is marked as {role}"))
+}
+
+pub fn remove_folder(path: &str) -> Result<Value, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("provide the folder path to remove".into());
+    }
+    let target = PathBuf::from(path);
+    let mut removed = None;
+    let mut sources = Vec::new();
+    for source in load_sources() {
+        if removed.is_none() && same_folder(Path::new(&source.path), &target) {
+            removed = Some(source.name);
+        } else {
+            sources.push(source);
+        }
+    }
+    let Some(name) = removed else {
+        return Err("that folder is not one of the added library sources".into());
+    };
+    write_sources(&sources)?;
+    Ok(json!({"removed": name, "sources": self::sources()?["sources"].clone()}))
+}
+/// Every place collections are read from: added folders first, then installed
+/// locations, each with how many collections it contributes.
+pub fn sources() -> Result<Value, String> {
+    let mut list: Vec<Value> = Vec::new();
+    for source in load_sources() {
+        let (symbols, footprints) = counts(&PathBuf::from(&source.path)).unwrap_or((0, 0));
+        list.push(json!({
+            "name": source.name,
+            "path": source.path,
+            "kind": "added",
+            "role": source.role,
+            "symbol_libraries": symbols,
+            "footprint_libraries": footprints,
+        }));
+    }
+    for installed in built_in_roots() {
+        if !std::fs::metadata(&installed).is_ok_and(|metadata| metadata.is_dir()) {
+            continue;
+        }
+        let (symbols, footprints) = counts(&installed).unwrap_or((0, 0));
+        list.push(json!({
+            "name": "Installed collections",
+            "path": installed.to_string_lossy(),
+            "kind": "built-in",
+            "symbol_libraries": symbols,
+            "footprint_libraries": footprints,
+        }));
+    }
+    Ok(json!({"sources": list}))
+}
 fn paths() -> Vec<PathBuf> {
+    let mut roots = built_in_roots();
+    roots.extend(
+        load_sources()
+            .into_iter()
+            .map(|source| PathBuf::from(source.path)),
+    );
+    roots
+}
+fn built_in_roots() -> Vec<PathBuf> {
     let mut roots = vec![
         PathBuf::from("/usr/share/kicad"),
         PathBuf::from("/usr/local/share/kicad"),
@@ -130,7 +399,10 @@ fn paths() -> Vec<PathBuf> {
     roots
 }
 pub fn catalog() -> Result<Value, String> {
-    catalog_paths(paths(), 4096)
+    let mut out = catalog_paths(paths(), 4096)?;
+    out["configurable_connectors"] =
+        pcbcraft_library::connector_catalog::ConnectorCatalog::summary_json()?;
+    Ok(out)
 }
 fn catalog_paths(roots: Vec<PathBuf>, scan_limit: usize) -> Result<Value, String> {
     let mut symbol_files = vec![];
@@ -138,6 +410,7 @@ fn catalog_paths(roots: Vec<PathBuf>, scan_limit: usize) -> Result<Value, String
     let mut truncated_directories = vec![];
     let mut seen = std::collections::BTreeSet::new();
     for root in roots {
+        let source = source_label(&root);
         for (directory, symbols) in [
             (root.join("symbols"), true),
             (root.join("footprints"), false),
@@ -159,7 +432,7 @@ fn catalog_paths(roots: Vec<PathBuf>, scan_limit: usize) -> Result<Value, String
             }
             for path in entries {
                 let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                let item = json!({"name":path.file_stem().and_then(|s|s.to_str()).unwrap_or(""),"path":path.to_string_lossy()});
+                let item = json!({"name":path.file_stem().and_then(|s|s.to_str()).unwrap_or(""),"path":path.to_string_lossy(),"source":source});
                 if symbols
                     && extension == "kicad_sym"
                     && std::fs::metadata(&path)
@@ -251,6 +524,335 @@ pub fn search(path: &Path, kind: &str, query: &str, limit: usize) -> Result<Valu
         json!({"entries":entries,"total":total,"limit":limit,"truncated":total>limit||scan_truncated,"scan_truncated":scan_truncated}),
     )
 }
+/// Compare two library parts of the same kind and report what differs.
+pub fn compare(
+    path_a: &Path,
+    path_b: &Path,
+    kind: &str,
+    name_a: &str,
+    name_b: &str,
+) -> Result<Value, String> {
+    match kind {
+        "symbol" => {
+            let a = symbol(path_a, name_a)?;
+            let b = symbol(path_b, name_b)?;
+            let pins = |s: &SymbolDefinition| -> Vec<String> {
+                s.pins.iter().map(|p| p.number.clone()).collect()
+            };
+            let (pa, pb) = (pins(&a), pins(&b));
+            let only = |x: &[String], y: &[String]| -> Vec<String> {
+                x.iter().filter(|n| !y.contains(n)).cloned().collect()
+            };
+            let units =
+                |s: &SymbolDefinition| -> u32 { s.pins.iter().map(|p| p.unit).max().unwrap_or(1) };
+            Ok(json!({
+                "kind": "symbol",
+                "a": {
+                    "name": a.name,
+                    "path": path_a.to_string_lossy(),
+                    "pins": pa.len(),
+                    "units": units(&a),
+                    "reference_prefix": a.reference,
+                    "default_value": a.value,
+                    "footprint": a.footprint,
+                },
+                "b": {
+                    "name": b.name,
+                    "path": path_b.to_string_lossy(),
+                    "pins": pb.len(),
+                    "units": units(&b),
+                    "reference_prefix": b.reference,
+                    "default_value": b.value,
+                    "footprint": b.footprint,
+                },
+                "shared_pins": pa.iter().filter(|n| pb.contains(n)).count(),
+                "pins_only_in_a": only(&pa, &pb),
+                "pins_only_in_b": only(&pb, &pa),
+                "same_footprint_recommendation": a.footprint == b.footprint,
+                "same_reference_prefix": a.reference == b.reference,
+            }))
+        }
+        "footprint" => {
+            let a = footprint(path_a)?;
+            let b = footprint(path_b)?;
+            let pads = |f: &FootprintDefinition| -> Vec<String> {
+                f.pads.iter().map(|p| p.number.clone()).collect()
+            };
+            let (pa, pb) = (pads(&a), pads(&b));
+            let only = |x: &[String], y: &[String]| -> Vec<String> {
+                x.iter().filter(|n| !y.contains(n)).cloned().collect()
+            };
+            Ok(json!({
+                "kind": "footprint",
+                "a": {
+                    "name": a.name,
+                    "path": path_a.to_string_lossy(),
+                    "pads": pa.len(),
+                    "graphics": a.graphics.len(),
+                },
+                "b": {
+                    "name": b.name,
+                    "path": path_b.to_string_lossy(),
+                    "pads": pb.len(),
+                    "graphics": b.graphics.len(),
+                },
+                "shared_pads": pa.iter().filter(|n| pb.contains(n)).count(),
+                "pads_only_in_a": only(&pa, &pb),
+                "pads_only_in_b": only(&pb, &pa),
+                "same_pad_count": pa.len() == pb.len(),
+            }))
+        }
+        _ => Err("kind must be symbol or footprint".into()),
+    }
+}
+use pcbcraft_library::listing_adapters::MAX_LISTINGS;
+/// Page size when the caller gives no limit.
+const DEFAULT_LIST_LIMIT: usize = 30;
+
+fn source_rank(source: ListingSource) -> u8 {
+    match source {
+        ListingSource::Fixture | ListingSource::Generated => 0,
+        ListingSource::Project => 1,
+        ListingSource::Installed => 2,
+        ListingSource::OpenLibrary => 3,
+        ListingSource::Distributor => 4,
+    }
+}
+
+/// Filter listings and return one page, grouped by source.
+///
+/// # Rules
+/// `limit` is 1 to 100. Groups follow fixture, project, installed, then
+/// distributor, and inside a group the listings keep the order they came in;
+/// nothing is merged by rank. `cursor` maps a source name to how many of its
+/// matches were already returned. The answer is `{items, next_cursor,
+/// total_known}`; `next_cursor` is null when nothing is left.
+/// # Dependencies
+/// `crates/library/src/listing.rs` for `PartFilter::validate` and `matches`.
+/// # Do not
+/// Change any state or reorder listings across sources.
+pub fn list_listings(
+    listings: Vec<PartListing>,
+    filter: &PartFilter,
+    limit: usize,
+    cursor: &std::collections::BTreeMap<String, usize>,
+) -> Result<Value, String> {
+    if limit == 0 || limit > 100 {
+        return Err("limit must be an integer from 1 to 100".into());
+    }
+    if listings.len() > MAX_LISTINGS {
+        return Err(format!(
+            "at most {MAX_LISTINGS} listings may be filtered at once"
+        ));
+    }
+    filter.validate()?;
+    let mut groups: Vec<(u8, String, Vec<PartListing>)> = vec![];
+    for listing in listings.into_iter().filter(|l| filter.matches(l)) {
+        let rank = source_rank(listing.source);
+        match groups
+            .iter_mut()
+            .find(|(r, id, _)| *r == rank && *id == listing.source_id)
+        {
+            Some((_, _, items)) => items.push(listing),
+            None => groups.push((rank, listing.source_id.clone(), vec![listing])),
+        }
+    }
+    groups.sort_by_key(|(rank, _, _)| *rank);
+    let total: usize = groups.iter().map(|(_, _, items)| items.len()).sum();
+    let mut page = vec![];
+    let mut next = std::collections::BTreeMap::new();
+    let mut more = false;
+    for (_, id, items) in groups {
+        let start = cursor.get(&id).copied().unwrap_or(0).min(items.len());
+        let take = (limit - page.len()).min(items.len() - start);
+        page.extend(items[start..start + take].iter().cloned());
+        more |= start + take < items.len();
+        next.insert(id, start + take);
+    }
+    let next_cursor = if more { json!(next) } else { Value::Null };
+    Ok(json!({"items": page, "next_cursor": next_cursor, "total_known": total}))
+}
+
+type ListArgs = (
+    PartFilter,
+    usize,
+    std::collections::BTreeMap<String, usize>,
+    Vec<PartListing>,
+);
+
+fn list_args(args: &Value) -> Result<ListArgs, String> {
+    let filter: PartFilter = match args.get("filter") {
+        None => PartFilter::default(),
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("filter: {e}"))?,
+    };
+    let limit = match args.get("limit") {
+        None => DEFAULT_LIST_LIMIT,
+        Some(v) => v
+            .as_u64()
+            .filter(|v| (1..=100).contains(v))
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or("limit must be an integer from 1 to 100")?,
+    };
+    let cursor: std::collections::BTreeMap<String, usize> = match args.get("cursor") {
+        None | Some(Value::Null) => Default::default(),
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("cursor: {e}"))?,
+    };
+    let listings: Vec<PartListing> = match args.get("listings") {
+        None => vec![],
+        Some(Value::Array(a)) if a.len() > MAX_LISTINGS => {
+            return Err(format!(
+                "at most {MAX_LISTINGS} listings may be filtered at once"
+            ));
+        }
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("listings: {e}"))?,
+    };
+    Ok((filter, limit, cursor, listings))
+}
+
+/// Listings from installed library files, clipped to `room`. Returns the
+/// listings and how many symbols were found in all.
+fn installed_listings(roots: Vec<PathBuf>, room: usize) -> (Vec<PartListing>, usize) {
+    let mut out = vec![];
+    let mut found = 0;
+    let Ok(scanned) = catalog_paths(roots, 4096) else {
+        return (out, found);
+    };
+    let paths = scanned["symbol_libraries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for path in paths.iter().filter_map(|p| p["path"].as_str()) {
+        let Ok(defs) = symbols(Path::new(path)) else {
+            continue;
+        };
+        let part = listings_from_symbols(
+            &defs,
+            ListingSource::Installed,
+            path,
+            room.saturating_sub(out.len()),
+        );
+        found += part.total_known;
+        out.extend(part.items);
+    }
+    (out, found)
+}
+
+/// Listings from the parts saved inside the project.
+///
+/// # Rules
+/// `source` is `Project` and `source_id` the project name. At most
+/// `MAX_LISTINGS` come back.
+/// # Dependencies
+/// `crates/library/src/listing_adapters.rs`; `Project::library` in `crates/doc/src/lib.rs`.
+/// # Do not
+/// Change the project.
+pub fn project_listings(project: &pcbcraft_doc::Project) -> Vec<PartListing> {
+    listings_from_symbols(
+        &project.library.symbols,
+        ListingSource::Project,
+        &project.name,
+        MAX_LISTINGS,
+    )
+    .items
+}
+
+/// `library.list` over the loaded listings, the project's parts when a
+/// project is given, and the installed libraries.
+///
+/// # Rules
+/// Same arguments and answer as `library.list`. When the sources hold more
+/// than `MAX_LISTINGS` symbols the answer carries `clipped: true` and
+/// `found_symbols` with the real count.
+/// # Dependencies
+/// [`list_listings`] in this file.
+/// # Do not
+/// Change the project or any library.
+pub fn list_with_project(
+    args: &Value,
+    project: Option<&pcbcraft_doc::Project>,
+) -> Result<Value, String> {
+    list_over(args, project, paths())
+}
+
+/// Find the footprint a symbol's package text names, such as
+/// `Resistor_SMD:R_0805_2012Metric`, in the installed footprint folders.
+///
+/// # Rules
+/// - A text without a colon is a bare footprint name, searched in every folder.
+/// - Names with path separators or `..` are refused; nothing outside the
+///   registered folders is read.
+///
+/// # Dependencies
+/// `catalog_paths` and [`footprint`] in this file.
+///
+/// # Do not
+/// Run on the frame thread; it reads files.
+pub fn resolve_footprint_over(
+    roots: Vec<PathBuf>,
+    package: &str,
+) -> Result<FootprintDefinition, String> {
+    let (library, name) = match package.split_once(':') {
+        Some((l, n)) => (Some(l), n),
+        None => (None, package),
+    };
+    if name.is_empty()
+        || name.len() > 256
+        || [name, library.unwrap_or("")]
+            .iter()
+            .any(|t| t.contains(['/', '\\']) || t.contains(".."))
+    {
+        return Err("that package name cannot be looked up".into());
+    }
+    let catalog = catalog_paths(roots, 4096)?;
+    for lib in catalog["footprint_libraries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if library.is_some_and(|l| lib["name"].as_str() != Some(l)) {
+            continue;
+        }
+        if let Some(dir) = lib["path"].as_str() {
+            let file = Path::new(dir).join(format!("{name}.kicad_mod"));
+            if file.is_file() {
+                return footprint(&file);
+            }
+        }
+    }
+    Err(format!("no installed footprint called {package}"))
+}
+
+/// [`resolve_footprint_over`] over the user's own installed folders.
+pub fn resolve_footprint(package: &str) -> Result<FootprintDefinition, String> {
+    resolve_footprint_over(paths(), package)
+}
+/// `library.list` over chosen installed folders instead of the user's own.
+///
+/// # Rules
+/// Same arguments and answer as [`list_with_project`].
+/// # Dependencies
+/// [`list_listings`] in this file.
+/// # Do not
+/// Change the project or any library.
+pub fn list_over(
+    args: &Value,
+    project: Option<&pcbcraft_doc::Project>,
+    roots: Vec<PathBuf>,
+) -> Result<Value, String> {
+    let (filter, limit, cursor, mut listings) = list_args(args)?;
+    listings.extend(pcbcraft_library::connector_catalog::ConnectorCatalog::listings()?);
+    listings.extend(project.map(project_listings).unwrap_or_default());
+    let room = MAX_LISTINGS.saturating_sub(listings.len());
+    let (installed, found) = installed_listings(roots, room);
+    let clipped = found > installed.len();
+    listings.extend(installed);
+    let mut out = list_listings(listings, &filter, limit, &cursor)?;
+    if clipped {
+        out["clipped"] = json!(true);
+        out["found_symbols"] = json!(found);
+    }
+    Ok(out)
+}
 pub fn read_tool(name: &str, args: &Value) -> Result<Value, String> {
     let text = |key: &str| {
         args.get(key)
@@ -259,6 +861,28 @@ pub fn read_tool(name: &str, args: &Value) -> Result<Value, String> {
     };
     match name {
         "library.catalog" => catalog(),
+        "library.sources" => sources(),
+        "library.list" => list_with_project(args, None),
+        "design.recents" => Ok(json!({"designs": crate::recents::load_recent_paths()})),
+        "library.add_folder" => {
+            let name = match args.get("name") {
+                None => None,
+                Some(v) => Some(v.as_str().ok_or("name must be a string")?),
+            };
+            add_folder(text("path")?, name)
+        }
+        "library.remove_folder" => remove_folder(text("path")?),
+        "library.set_source_role" => {
+            let role = match args.get("role") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(v.as_str().ok_or("role must be a string or null")?),
+            };
+            set_source_role(text("path")?, role)
+        }
+        "library.read_part_sidecar" => {
+            let sidecar = pcbcraft_library::read_part_sidecar(Path::new(text("path")?))?;
+            Ok(json!({"sidecar": sidecar}))
+        }
         "library.search" => {
             let limit = match args.get("limit") {
                 None => 30,
@@ -314,6 +938,29 @@ pub fn read_tool(name: &str, args: &Value) -> Result<Value, String> {
                 json!({"definition":definition,"kind":"footprint","path":text("path")?,"source_truncated":truncated}),
             )
         }
+        "library.compare" => {
+            let optional = |key: &str| -> Result<String, String> {
+                match args.get(key) {
+                    None => Ok(String::new()),
+                    Some(v) => v
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or(format!("{key} must be a string")),
+                }
+            };
+            compare(
+                Path::new(text("path_a")?),
+                Path::new(text("path_b")?),
+                text("kind")?,
+                &optional("name_a")?,
+                &optional("name_b")?,
+            )
+        }
+        "library.samtec.manufacturer_page" => {
+            let url = pcbcraft_library::samtec::manufacturer_page_url(text("mpn")?)
+                .map_err(|e| e.to_string())?;
+            Ok(json!({"url": url}))
+        }
         _ => Err("unknown library query".into()),
     }
 }
@@ -327,10 +974,7 @@ mod tests {
     impl TestDirectory {
         fn new() -> Result<Self, String> {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_nanos();
+            let timestamp = pcbcraft_clock::unix_nanos();
             let path = std::env::temp_dir().join(format!(
                 "pcbcraft-library-test-{}-{timestamp}-{}",
                 std::process::id(),
@@ -422,6 +1066,285 @@ mod tests {
         assert_eq!(results["truncated"], true);
         assert_eq!(results["scan_truncated"], false);
         assert_eq!(results["entries"].as_array().map(Vec::len), Some(1));
+        Ok(())
+    }
+    #[test]
+    fn added_folders_join_the_one_library_and_can_be_removed_again() -> Result<(), String> {
+        let _guard = SOURCES_TEST_LOCK
+            .lock()
+            .map_err(|_| "test lock unavailable")?;
+        let root = TestDirectory::new()?;
+        let vendor = root.0.join("digikey_footprints");
+        std::fs::create_dir_all(vendor.join("footprints")).map_err(|e| e.to_string())?;
+        std::fs::write(
+            vendor.join("MyParts.kicad_sym"),
+            "(kicad_symbol_lib (version 20250114))",
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(vendor.join("footprints/Resistors.pretty"))
+            .map_err(|e| e.to_string())?;
+        SOURCES_PATH_TEST
+            .lock()
+            .map_err(|_| "test lock unavailable")?
+            .replace(root.0.join("sources.json"));
+        let added = add_folder(vendor.to_str().ok_or("folder path is not text")?, None)?;
+        assert_eq!(added["added"], "digikey footprints");
+        assert_eq!(added["symbol_libraries"], 1);
+        assert_eq!(added["footprint_libraries"], 1);
+        let listing = catalog_paths(paths(), 64)?;
+        let entry = listing["symbol_libraries"]
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["name"] == "MyParts"))
+            .ok_or("the added folder is missing from the unified listing")?;
+        assert_eq!(
+            entry["source"], "digikey footprints",
+            "every collection says where it came from"
+        );
+        let listed = sources()?;
+        assert!(
+            listed["sources"].as_array().is_some_and(|items| items
+                .iter()
+                .any(|item| item["kind"] == "added"
+                    && item["name"] == "digikey footprints"
+                    && item["symbol_libraries"] == 1)),
+            "the source list names the added folder with its counts"
+        );
+        assert!(
+            add_folder(vendor.to_str().ok_or("folder path is not text")?, None)
+                .is_err_and(|error| error.contains("already")),
+            "the same folder is not registered twice"
+        );
+        assert!(
+            add_folder("/definitely/missing/library-folder", None)
+                .is_err_and(|error| error.contains("folder that exists")),
+            "a missing folder is refused"
+        );
+        let long = "n".repeat(65);
+        assert!(
+            add_folder(
+                vendor.to_str().ok_or("folder path is not text")?,
+                Some(&long)
+            )
+            .is_err_and(|error| error.contains("64")),
+            "source names are bounded"
+        );
+        let removed = remove_folder(vendor.to_str().ok_or("folder path is not text")?)?;
+        assert_eq!(removed["removed"], "digikey footprints");
+        assert!(
+            remove_folder(vendor.to_str().ok_or("folder path is not text")?)
+                .is_err_and(|error| error.contains("not one of")),
+            "removing twice says so plainly"
+        );
+        SOURCES_PATH_TEST
+            .lock()
+            .map_err(|_| "test lock unavailable")?
+            .take();
+        Ok(())
+    }
+    #[test]
+    fn library_source_tools_answer_through_the_read_tool_router() -> Result<(), String> {
+        let _guard = SOURCES_TEST_LOCK
+            .lock()
+            .map_err(|_| "test lock unavailable")?;
+        let listing = read_tool("library.sources", &json!({}))?;
+        assert!(
+            listing["sources"].is_array(),
+            "sources always answers with a list"
+        );
+        assert!(
+            read_tool("design.recents", &json!({}))?["designs"].is_array(),
+            "the recent designs tool answers through the same router"
+        );
+        assert!(
+            read_tool("library.add_folder", &json!({"path": 4}))
+                .is_err_and(|error| error.contains("path")),
+            "a non-text path is refused"
+        );
+        assert!(
+            read_tool("library.remove_folder", &json!({}))
+                .is_err_and(|error| error.contains("path")),
+            "a missing path is refused"
+        );
+        assert!(
+            read_tool("library.set_source_role", &json!({}))
+                .is_err_and(|error| error.contains("path")),
+            "role changes need a path"
+        );
+        Ok(())
+    }
+    #[test]
+    fn personal_and_shared_roles_point_at_one_folder_each() -> Result<(), String> {
+        let _guard = SOURCES_TEST_LOCK
+            .lock()
+            .map_err(|_| "test lock unavailable")?;
+        let root = TestDirectory::new()?;
+        let personal = root.0.join("personal-lib");
+        std::fs::create_dir_all(&personal).map_err(|e| e.to_string())?;
+        SOURCES_PATH_TEST
+            .lock()
+            .map_err(|_| "test lock unavailable")?
+            .replace(root.0.join("sources.json"));
+        add_folder(personal.to_str().ok_or("path")?, Some("Personal"))?;
+        set_source_role(personal.to_str().ok_or("path")?, Some("personal"))?;
+        let resolved = folder_for_role("personal")?;
+        assert_eq!(
+            resolved.canonicalize().map_err(|e| e.to_string())?,
+            personal.canonicalize().map_err(|e| e.to_string())?
+        );
+        SOURCES_PATH_TEST
+            .lock()
+            .map_err(|_| "test lock unavailable")?
+            .take();
+        Ok(())
+    }
+    fn listed(mpn: &str, source: ListingSource, id: &str) -> PartListing {
+        let mut l = pcbcraft_library::listing::listing_from_result(
+            &pcbcraft_library::sources::PartResult {
+                source: id.into(),
+                mpn: mpn.into(),
+                manufacturer: String::new(),
+                description: String::new(),
+                kind: "resistor".into(),
+                distributor: String::new(),
+                sku: String::new(),
+                stock: 0,
+                price_breaks: vec![],
+                lifecycle: String::new(),
+                datasheet_url: String::new(),
+                product_url: String::new(),
+                retrieved_at: 0,
+            },
+            &Default::default(),
+        );
+        l.source = source;
+        l.source_id = id.into();
+        l
+    }
+
+    #[test]
+    fn results_keep_each_sources_own_order_and_are_grouped_by_source() -> Result<(), String> {
+        let input = vec![
+            listed("D2", ListingSource::Distributor, "Shop"),
+            listed("I2", ListingSource::Installed, "Lib"),
+            listed("D1", ListingSource::Distributor, "Shop"),
+            listed("F1", ListingSource::Fixture, "Sample"),
+            listed("I1", ListingSource::Installed, "Lib"),
+        ];
+        let out = list_listings(
+            input.clone(),
+            &PartFilter::default(),
+            3,
+            &Default::default(),
+        )?;
+        let mpns = |v: &Value| -> Vec<String> {
+            v["items"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|i| i["mpn"].as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(mpns(&out), ["F1", "I2", "I1"]);
+        assert_eq!(out["total_known"], 5);
+        let cursor: std::collections::BTreeMap<String, usize> =
+            serde_json::from_value(out["next_cursor"].clone()).map_err(|e| e.to_string())?;
+        let next = list_listings(input, &PartFilter::default(), 3, &cursor)?;
+        assert_eq!(mpns(&next), ["D2", "D1"]);
+        assert!(next["next_cursor"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn library_list_includes_embedded_samtec_connector_series() -> Result<(), String> {
+        let out = list_over(
+            &json!({"filter": {"text": "TSW"}, "limit": 10}),
+            None,
+            vec![],
+        )?;
+        let mpns: Vec<String> = out["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["mpn"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(mpns.iter().any(|mpn| mpn == "TSW"));
+        let sources: Vec<&str> = out["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["source"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(sources.contains(&"generated"));
+        Ok(())
+    }
+
+    #[test]
+    fn library_list_refuses_a_bad_limit_and_too_many_categories() {
+        for limit in [0, 101] {
+            assert!(read_tool("library.list", &json!({"limit": limit})).is_err());
+        }
+        let many = json!({"categories": vec!["led"; 17]});
+        assert!(read_tool("library.list", &json!({"filter": many})).is_err());
+    }
+
+    #[test]
+    fn samtec_manufacturer_page_query_returns_the_product_url() -> Result<(), String> {
+        let out = read_tool(
+            "library.samtec.manufacturer_page",
+            &json!({"mpn":"TSW-103-07-G-S"}),
+        )?;
+        assert_eq!(out["url"], "https://www.samtec.com/products/tsw-103-07-g-s");
+        Ok(())
+    }
+
+    #[test]
+    fn a_package_text_finds_its_installed_footprint_and_refuses_paths() -> Result<(), String> {
+        let root = TestDirectory::new()?;
+        let pretty = root.0.join("footprints/Resistor_SMD.pretty");
+        std::fs::create_dir_all(&pretty).map_err(|e| e.to_string())?;
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../library/tests/fixtures/R_0805_2012Metric.kicad_mod"
+        );
+        std::fs::copy(fixture, pretty.join("R_0805_2012Metric.kicad_mod"))
+            .map_err(|e| e.to_string())?;
+        let roots = vec![root.0.clone()];
+        let found = resolve_footprint_over(roots.clone(), "Resistor_SMD:R_0805_2012Metric")?;
+        assert!(!found.pads.is_empty());
+        assert!(resolve_footprint_over(roots.clone(), "R_0805_2012Metric").is_ok());
+        assert!(resolve_footprint_over(roots.clone(), "Other:R_0805_2012Metric").is_err());
+        assert!(resolve_footprint_over(roots.clone(), "Resistor_SMD:../x").is_err());
+        assert!(resolve_footprint_over(roots, "Resistor_SMD:Nope").is_err());
+        Ok(())
+    }
+    #[test]
+    fn library_list_over_installed_and_fixture_sources_returns_both_kinds() -> Result<(), String> {
+        let dir = TestDirectory::new()?;
+        let symbols_dir = dir.0.join("symbols");
+        std::fs::create_dir(&symbols_dir).map_err(|e| e.to_string())?;
+        let device = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../library/tests/fixtures/device.kicad_sym");
+        std::fs::copy(device, symbols_dir.join("Device.kicad_sym")).map_err(|e| e.to_string())?;
+        let fixture = listed("F1", ListingSource::Fixture, "Sample");
+        let args = json!({"listings": [fixture], "limit": 100});
+        let out = list_over(&args, None, vec![dir.0.clone()])?;
+        let kinds: Vec<&str> = out["items"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|i| i["source"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            kinds.contains(&"fixture") && kinds.contains(&"installed"),
+            "{kinds:?}"
+        );
+        assert_eq!(kinds[0], "fixture", "groups follow the fixed source order");
         Ok(())
     }
 }
