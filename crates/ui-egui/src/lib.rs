@@ -1,6 +1,7 @@
 //! One window, shared project, tabbed workspaces. Edits use the engine exclusively.
 mod authoring;
 mod canvas;
+mod i18n;
 mod library;
 use egui::{Align2, Color32, FontId, Rect, Stroke, Vec2};
 use pcbcraft_doc::{Id, PinRef, Project, TEMPLATES};
@@ -21,6 +22,8 @@ struct Preferences {
     dark: bool,
     grid: bool,
     accent: [u8; 3],
+    #[serde(default)]
+    language: i18n::Lang,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -28,6 +31,7 @@ impl Default for Preferences {
             dark: true,
             grid: true,
             accent: [91, 224, 188],
+            language: i18n::Lang::default(),
         }
     }
 }
@@ -94,6 +98,7 @@ pub struct App {
     command_open: bool,
     capture: Option<String>,
     frames: u32,
+    fonts_ready: bool,
     library: library::Browser,
 }
 impl App {
@@ -147,6 +152,7 @@ impl App {
         capture: Option<String>,
         tab: Option<&str>,
     ) -> Self {
+        let lang = preferences.language;
         let project = session
             .lock()
             .map(|s| s.project.clone())
@@ -188,7 +194,10 @@ impl App {
             drag: None,
             drag_offset: Point::default(),
             cursor: None,
-            message: "Ready · A add · W wire · X route · M move · R rotate · E properties".into(),
+            message: i18n::t(
+                lang,
+                "Ready · A add · W wire · X route · M move · R rotate · E properties",
+            ),
             value: String::new(),
             x: 0.0,
             y: 0.0,
@@ -202,7 +211,77 @@ impl App {
             command_open: false,
             capture,
             frames: 0,
+            fonts_ready: false,
             library,
+        }
+    }
+    fn tr(&self, key: &'static str) -> String {
+        i18n::t(self.preferences.language, key)
+    }
+    fn trf(&self, key: &'static str, args: &[&str]) -> String {
+        i18n::tf(self.preferences.language, key, args)
+    }
+    fn ensure_fonts(&mut self, ctx: &egui::Context) {
+        if self.fonts_ready {
+            return;
+        }
+        self.fonts_ready = true;
+        let mut fonts = egui::FontDefinitions::default();
+        let mut added = false;
+
+        #[cfg(has_hebrew_craft_font)]
+        {
+            const HEBREW_NAME: &str = "Noto Sans Hebrew";
+            let bytes = include_bytes!(env!("HEBREW_CRAFT_FONT_PATH"));
+            fonts.font_data.insert(
+                HEBREW_NAME.into(),
+                std::sync::Arc::new(egui::FontData::from_static(bytes)),
+            );
+            append_hebrew_fallback(&mut fonts, HEBREW_NAME);
+            added = true;
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            const CANDIDATES: [(&str, &str); 8] = [
+                (
+                    "Arial Hebrew",
+                    "/System/Library/Fonts/Supplemental/Arial Hebrew.ttf",
+                ),
+                ("SF Hebrew", "/System/Library/Fonts/SFHebrew.ttf"),
+                ("Arial Hebrew Local", "/Library/Fonts/Arial Hebrew.ttf"),
+                (
+                    "Noto Sans Hebrew",
+                    "/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf",
+                ),
+                (
+                    "Noto Sans Hebrew Arch",
+                    "/usr/share/fonts/noto/NotoSansHebrew-Regular.ttf",
+                ),
+                (
+                    "DejaVu Sans",
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                ),
+                ("Arial", "C:\\Windows\\Fonts\\arial.ttf"),
+                ("Segoe UI", "C:\\Windows\\Fonts\\segoeui.ttf"),
+            ];
+            for (name, path) in CANDIDATES {
+                if fonts.font_data.contains_key(name) {
+                    continue;
+                }
+                if let Ok(bytes) = std::fs::read(path) {
+                    fonts.font_data.insert(
+                        name.into(),
+                        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                    );
+                    append_hebrew_fallback(&mut fonts, name);
+                    added = true;
+                }
+            }
+        }
+
+        if added {
+            ctx.set_fonts(fonts);
         }
     }
     fn refresh(&mut self) {
@@ -229,25 +308,27 @@ impl App {
         }
     }
     fn run(&mut self, command: &str, params: Value) {
+        let lang = self.preferences.language;
         let result = self
             .session
             .lock()
-            .map_err(|_| "Session unavailable".to_string())
+            .map_err(|_| i18n::t(lang, "Session unavailable"))
             .and_then(|mut s| {
                 s.execute(command, params, Some(self.revision))
                     .map_err(|e| e.to_string())
             });
         match result {
             Ok(v) => {
-                self.message = format!("{command} · committed");
+                self.message = self.trf("{} · committed", &[command]);
                 if let Some(skipped) = v
                     .pointer("/result/unassigned_components")
                     .and_then(Value::as_array)
                     && !skipped.is_empty()
                 {
-                    self.message = format!(
+                    let count = skipped.len().to_string();
+                    self.message = self.trf(
                         "{} library symbols need a footprint assignment in Libraries",
-                        skipped.len()
+                        &[&count],
                     );
                 }
                 if let Some(id) = v.pointer("/result/id").and_then(Value::as_u64) {
@@ -265,13 +346,13 @@ impl App {
         let result = pcbcraft_mcp::call_tool(&self.session, name, &args);
         let success = result.get("isError").and_then(Value::as_bool) != Some(true);
         self.message = if success {
-            format!("{name} · complete")
+            self.trf("{} · complete", &[name])
         } else {
             result
                 .pointer("/content/0/text")
                 .and_then(Value::as_str)
-                .unwrap_or("operation failed")
-                .into()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| self.tr("operation failed"))
         };
         self.refresh();
         if success && (name == "save" || name == "open") {
@@ -485,16 +566,16 @@ impl App {
                     ui.label(egui::RichText::new("*").color(self.accent()));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Appearance").clicked() {
+                    if ui.button(self.tr("Appearance")).clicked() {
                         self.appearance = !self.appearance;
                     }
-                    if ui.button("Save  Ctrl+S").clicked() {
+                    if ui.button(self.tr("Save  Ctrl+S")).clicked() {
                         self.tool_call("save", json!({"path":self.path}));
                     }
-                    if ui.button("Redo").clicked() {
+                    if ui.button(self.tr("Redo")).clicked() {
                         self.tool_call("redo", json!({}));
                     }
-                    if ui.button("Undo").clicked() {
+                    if ui.button(self.tr("Undo")).clicked() {
                         self.tool_call("undo", json!({}));
                     }
                     ui.label(
@@ -507,67 +588,73 @@ impl App {
             ui.add_space(5.0);
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
-                for (tab, label) in [
+                for (tab, label_key) in [
                     (Tab::Schematic, "Schematic"),
                     (Tab::Pcb, "PCB Layout"),
                     (Tab::Libraries, "Libraries"),
                     (Tab::Checks, "Checks"),
                 ] {
+                    let label = self.tr(label_key);
+                    let logical_label = i18n::t_logical(self.preferences.language, label_key);
                     let (_, rect) = ui.allocate_space(Vec2::new(132.0, 30.0));
                     let selected = self.tab == tab;
                     let accent = self.accent();
                     let ink = self.ink();
                     let muted = self.muted();
-                    let response = craft_ui::tabs::Tab::new(ui.id().with(label), label, selected)
-                        .show_at(ui, rect, |ui, response| {
-                            if selected || response.hovered() {
-                                ui.painter().rect_filled(
-                                    rect,
-                                    6.0,
-                                    accent.gamma_multiply(if selected { 0.16 } else { 0.08 }),
+                    let response =
+                        craft_ui::tabs::Tab::new(ui.id().with(label_key), logical_label, selected)
+                            .show_at(ui, rect, |ui, response| {
+                                if selected || response.hovered() {
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        6.0,
+                                        accent.gamma_multiply(if selected { 0.16 } else { 0.08 }),
+                                    );
+                                }
+                                ui.painter().text(
+                                    rect.center(),
+                                    Align2::CENTER_CENTER,
+                                    label,
+                                    FontId::proportional(13.0),
+                                    if selected { ink } else { muted },
                                 );
-                            }
-                            ui.painter().text(
-                                rect.center(),
-                                Align2::CENTER_CENTER,
-                                label,
-                                FontId::proportional(13.0),
-                                if selected { ink } else { muted },
-                            );
-                            if selected {
-                                ui.painter().line_segment(
-                                    [rect.left_bottom(), rect.right_bottom()],
-                                    Stroke::new(2.0, accent),
-                                );
-                            }
-                        });
+                                if selected {
+                                    ui.painter().line_segment(
+                                        [rect.left_bottom(), rect.right_bottom()],
+                                        Stroke::new(2.0, accent),
+                                    );
+                                }
+                            });
                     if response.clicked() {
                         self.change_tab(tab);
                     }
                 }
-                ui.add_enabled(false, egui::Button::new("3D Board"))
-                    .on_hover_text("A real Rust 3D viewer is planned.");
+                ui.add_enabled(false, egui::Button::new(self.tr("3D Board")))
+                    .on_hover_text(self.tr("A real Rust 3D viewer is planned."));
             });
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
                 if ui
-                    .selectable_label(matches!(self.tool, Tool::Select), "Select  Esc")
+                    .selectable_label(matches!(self.tool, Tool::Select), self.tr("Select  Esc"))
                     .clicked()
                 {
                     self.tool = Tool::Select;
                 }
                 match self.tab {
                     Tab::Schematic => {
-                        if ui.button("Add symbol  A").clicked() {
+                        if ui.button(self.tr("Add symbol  A")).clicked() {
                             self.palette = !self.palette;
                         }
                         if ui
-                            .selectable_label(matches!(self.tool, Tool::Wire(_)), "Wire  W")
+                            .selectable_label(
+                                matches!(self.tool, Tool::Wire(_)),
+                                self.tr("Wire  W"),
+                            )
                             .clicked()
                         {
                             self.tool = Tool::Wire(None);
                         }
-                        if ui.button("Sync to PCB >").clicked() {
+                        if ui.button(self.tr("Sync to PCB >")).clicked() {
                             self.run("board.sync", json!({}));
                             self.change_tab(Tab::Pcb);
                         }
@@ -589,16 +676,22 @@ impl App {
                                 );
                             });
                         if ui
-                            .selectable_label(matches!(self.tool, Tool::Route(_)), "Route  X")
+                            .selectable_label(
+                                matches!(self.tool, Tool::Route(_)),
+                                self.tr("Route  X"),
+                            )
                             .clicked()
                         {
                             self.tool = Tool::Route(None);
                         }
-                        if ui.button("Sync schematic").clicked() {
+                        if ui.button(self.tr("Sync schematic")).clicked() {
                             self.run("board.sync", json!({}));
                         }
                         if ui
-                            .selectable_label(matches!(self.tool, Tool::Cutout), "Circular cutout")
+                            .selectable_label(
+                                matches!(self.tool, Tool::Cutout),
+                                self.tr("Circular cutout"),
+                            )
                             .clicked()
                         {
                             self.tool = Tool::Cutout;
@@ -606,16 +699,16 @@ impl App {
                     }
                     _ => {}
                 }
-                if ui.button("Move  M").clicked() {
+                if ui.button(self.tr("Move  M")).clicked() {
                     self.tool = Tool::Move;
                 }
-                if ui.button("Rotate  R").clicked() {
+                if ui.button(self.tr("Rotate  R")).clicked() {
                     self.rotate();
                 }
-                if ui.button("Fit").clicked() {
+                if ui.button(self.tr("Fit")).clicked() {
                     self.fit();
                 }
-                if ui.button("Commands  Ctrl+K").clicked() {
+                if ui.button(self.tr("Commands  Ctrl+K")).clicked() {
                     self.command_open = !self.command_open;
                 }
             });
@@ -664,20 +757,20 @@ impl App {
             .show(ui, |ui| {
                 ui.add_space(12.0);
                 ui.label(
-                    egui::RichText::new("PROJECT")
+                    egui::RichText::new(self.tr("PROJECT"))
                         .size(10.0)
                         .color(self.muted()),
                 );
                 ui.label(egui::RichText::new(&self.project.name).strong());
                 ui.add_space(12.0);
                 if self.palette {
-                    ui.label(egui::RichText::new("Add symbol").strong());
-                    if ui.button("Browse KiCad libraries →").clicked() {
+                    ui.label(egui::RichText::new(self.tr("Add symbol")).strong());
+                    if ui.button(self.tr("Browse KiCad libraries →")).clicked() {
                         self.change_tab(Tab::Libraries);
                         self.palette = false;
                     }
                     for t in TEMPLATES {
-                        if ui.button(t.label).clicked() {
+                        if ui.button(self.tr(t.label)).clicked() {
                             self.change_tab(Tab::Schematic);
                             self.tool = Tool::Place(t.kind.into());
                             self.palette = false;
@@ -686,7 +779,7 @@ impl App {
                     ui.separator();
                 }
                 ui.label(
-                    egui::RichText::new("COMPONENTS")
+                    egui::RichText::new(self.tr("COMPONENTS"))
                         .size(10.0)
                         .color(self.muted()),
                 );
@@ -714,13 +807,17 @@ impl App {
                 }
                 if self.project.components.is_empty() {
                     ui.label(
-                        egui::RichText::new("Press A to place your first symbol")
+                        egui::RichText::new(self.tr("Press A to place your first symbol"))
                             .small()
                             .color(self.muted()),
                     );
                 }
                 ui.add_space(20.0);
-                ui.label(egui::RichText::new("NETS").size(10.0).color(self.muted()));
+                ui.label(
+                    egui::RichText::new(self.tr("NETS"))
+                        .size(10.0)
+                        .color(self.muted()),
+                );
                 for net in &self.project.nets {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("*").color(self.accent()));
@@ -728,26 +825,27 @@ impl App {
                     });
                 }
                 ui.add_space(20.0);
-                ui.label(egui::RichText::new("BOARD").size(10.0).color(self.muted()));
-                ui.label(format!(
-                    "{} × {} mm",
-                    self.project.board.width, self.project.board.height
-                ));
-                ui.label("2 copper layers · 1.6 mm");
-                ui.label(format!(
-                    "{} footprints · {} segments",
-                    self.project.board.footprints.len(),
-                    self.project.board.tracks.len()
-                ));
+                ui.label(
+                    egui::RichText::new(self.tr("BOARD"))
+                        .size(10.0)
+                        .color(self.muted()),
+                );
+                let bw = self.project.board.width.to_string();
+                let bh = self.project.board.height.to_string();
+                ui.label(self.trf("{} × {} mm", &[&bw, &bh]));
+                ui.label(self.tr("2 copper layers · 1.6 mm"));
+                let fp_count = self.project.board.footprints.len().to_string();
+                let tr_count = self.project.board.tracks.len().to_string();
+                ui.label(self.trf("{} footprints · {} segments", &[&fp_count, &tr_count]));
                 ui.add_space(20.0);
                 ui.separator();
                 ui.label(
-                    egui::RichText::new("One project. One window.")
+                    egui::RichText::new(self.tr("One project. One window."))
                         .small()
                         .color(self.muted()),
                 );
                 ui.label(
-                    egui::RichText::new("Scroll to zoom · middle-drag to pan")
+                    egui::RichText::new(self.tr("Scroll to zoom · middle-drag to pan"))
                         .small()
                         .color(self.muted()),
                 );
@@ -758,23 +856,44 @@ impl App {
             .default_size(250.0)
             .min_size(220.0)
             .show(ui, |ui| {
+                let lang = self.preferences.language;
                 ui.add_space(12.0);
                 if self.appearance {
-                    ui.heading("Appearance");
+                    ui.heading(i18n::t(lang, "Appearance"));
                     ui.add_space(12.0);
+                    let dark_label = i18n::t(lang, "Dark");
+                    let light_label = i18n::t(lang, "Light");
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.preferences.dark, true, "Dark");
-                        ui.selectable_value(&mut self.preferences.dark, false, "Light");
+                        ui.selectable_value(&mut self.preferences.dark, true, dark_label);
+                        ui.selectable_value(&mut self.preferences.dark, false, light_label);
                     });
-                    ui.checkbox(&mut self.preferences.grid, "Show grid");
-                    ui.label("Accent color");
+                    ui.checkbox(&mut self.preferences.grid, i18n::t(lang, "Show grid"));
+                    ui.label(i18n::t(lang, "Accent color"));
                     ui.color_edit_button_srgb(&mut self.preferences.accent);
+                    ui.add_space(10.0);
+                    ui.label(i18n::t(lang, "Language"));
+                    ui.horizontal(|ui| {
+                        let before = self.preferences.language;
+                        for choice in i18n::Lang::ALL {
+                            ui.selectable_value(
+                                &mut self.preferences.language,
+                                choice,
+                                choice.display_name(),
+                            );
+                        }
+                        if self.preferences.language != before {
+                            self.message = i18n::t(
+                                self.preferences.language,
+                                "Ready · A add · W wire · X route · M move · R rotate · E properties",
+                            );
+                        }
+                    });
                     ui.add_space(16.0);
-                    ui.label("Appearance is saved automatically.");
+                    i18n::wrapped_label(ui, self.preferences.language, "Appearance is saved automatically.");
                     return;
                 }
                 ui.label(
-                    egui::RichText::new("PROPERTIES")
+                    egui::RichText::new(i18n::t(lang, "PROPERTIES"))
                         .size(10.0)
                         .color(self.muted()),
                 );
@@ -789,16 +908,18 @@ impl App {
                         ui.heading(&c.reference);
                         if !c.units.is_empty() && self.project.component(id).is_some() {
                             let before = self.selected_unit;
+                            let unit_s = self.selected_unit.to_string();
                             egui::ComboBox::from_id_salt("selected-symbol-unit")
-                                .selected_text(format!("Unit {}", self.selected_unit))
+                                .selected_text(i18n::tf(lang, "Unit {}", &[&unit_s]))
                                 .show_ui(ui, |ui| {
                                     for unit in
                                         std::iter::once(1).chain(c.units.iter().map(|u| u.unit))
                                     {
+                                        let u_s = unit.to_string();
                                         ui.selectable_value(
                                             &mut self.selected_unit,
                                             unit,
-                                            format!("Unit {unit}"),
+                                            i18n::tf(lang, "Unit {}", &[&u_s]),
                                         );
                                     }
                                 });
@@ -807,26 +928,27 @@ impl App {
                             }
                         }
                         ui.label(&c.kind);
+                        let id_s = id.to_string();
                         ui.label(
-                            egui::RichText::new(format!("Stable ID {id}"))
+                            egui::RichText::new(self.trf("Stable ID {}", &[&id_s]))
                                 .small()
                                 .color(self.muted()),
                         );
                         ui.add_space(10.0);
-                        ui.label("Value");
+                        ui.label(self.tr("Value"));
                         ui.text_edit_singleline(&mut self.value);
-                        if ui.button("Apply value").clicked() {
+                        if ui.button(self.tr("Apply value")).clicked() {
                             self.run("component.value", json!({"id":c.id,"value":self.value}));
                         }
                         ui.add_space(12.0);
-                        ui.label("Position · mm");
+                        ui.label(self.tr("Position · mm"));
                         ui.horizontal(|ui| {
                             ui.label("X");
                             ui.add(egui::DragValue::new(&mut self.x).speed(0.1));
                             ui.label("Y");
                             ui.add(egui::DragValue::new(&mut self.y).speed(0.1));
                         });
-                        if ui.button("Apply position").clicked() {
+                        if ui.button(self.tr("Apply position")).clicked() {
                             let mut params = json!({"id":id,"position":{"x":self.x,"y":self.y}});
                             if self.project.component(id).is_some() {
                                 params["unit"] = json!(self.selected_unit);
@@ -840,22 +962,22 @@ impl App {
                                 params,
                             );
                         }
-                        if ui.button("Rotate 90°  R").clicked() {
+                        if ui.button(self.tr("Rotate 90°  R")).clicked() {
                             self.rotate();
                         }
                         ui.label(
                             c.library_footprint
                                 .as_ref()
-                                .map(|f| format!("Footprint: {}", f.definition.name))
+                                .map(|f| self.trf("Footprint: {}", &[&f.definition.name]))
                                 .unwrap_or_else(|| {
                                     if c.library_symbol.is_some() {
-                                        "Footprint: unassigned".into()
+                                        self.tr("Footprint: unassigned")
                                     } else {
-                                        "Footprint: starter package".into()
+                                        self.tr("Footprint: starter package")
                                     }
                                 }),
                         );
-                        if ui.button("Assign footprint in Libraries →").clicked() {
+                        if ui.button(self.tr("Assign footprint in Libraries →")).clicked() {
                             self.change_tab(Tab::Libraries);
                             self.library.kind = true;
                             self.library.pending = None;
@@ -865,68 +987,75 @@ impl App {
                             self.library.query.clear();
                         }
                         ui.add_space(12.0);
-                        ui.label("Pin / net");
+                        ui.label(self.tr("Pin / net"));
+                        let unassigned = self.tr("unassigned");
                         for pin in &c.pins {
                             ui.label(format!(
                                 "{} · {}",
                                 pin.number,
                                 pin.net
                                     .map(|n| self.project.net_name(n))
-                                    .unwrap_or("unassigned")
+                                    .unwrap_or(&unassigned)
                             ));
                         }
                     } else {
-                        ui.heading("Selected object");
-                        ui.label(format!("Stable ID {id}"));
+                        ui.heading(self.tr("Selected object"));
+                        let id_s = id.to_string();
+                        ui.label(self.trf("Stable ID {}", &[&id_s]));
                     }
                     ui.add_space(10.0);
-                    if ui.button("Delete  Del").clicked() {
+                    if ui.button(self.tr("Delete  Del")).clicked() {
                         self.run("object.delete", json!({"id":id}));
                         self.select(None);
                     }
                     ui.separator();
                 } else {
-                    ui.heading("Project settings");
-                    ui.label("Select an item to inspect and edit it.");
+                    ui.heading(self.tr("Project settings"));
+                    i18n::wrapped_label(ui, self.preferences.language, "Select an item to inspect and edit it.");
                     ui.add_space(12.0);
                 }
                 ui.label(
-                    egui::RichText::new("BOARD GEOMETRY")
+                    egui::RichText::new(self.tr("BOARD GEOMETRY"))
                         .size(10.0)
                         .color(self.muted()),
                 );
+                let mm_suffix = self.tr(" mm");
                 ui.horizontal(|ui| {
-                    ui.label("W");
+                    ui.label(self.tr("W"));
                     ui.add(
                         egui::DragValue::new(&mut self.width)
                             .speed(0.5)
-                            .suffix(" mm"),
+                            .suffix(mm_suffix.clone()),
                     );
                 });
                 ui.horizontal(|ui| {
-                    ui.label("H");
+                    ui.label(self.tr("H"));
                     ui.add(
                         egui::DragValue::new(&mut self.height)
                             .speed(0.5)
-                            .suffix(" mm"),
+                            .suffix(mm_suffix.clone()),
                     );
                 });
-                if ui.button("Apply board dimensions").clicked() {
+                if ui.button(self.tr("Apply board dimensions")).clicked() {
                     self.run(
                         "board.resize",
                         json!({"width":self.width,"height":self.height}),
                     );
                 }
                 ui.horizontal(|ui| {
-                    ui.label("Cutout radius");
+                    ui.label(self.tr("Cutout radius"));
                     ui.add(
                         egui::DragValue::new(&mut self.cutout_radius)
                             .speed(0.1)
-                            .suffix(" mm"),
+                            .suffix(mm_suffix),
                     );
                 });
                 ui.add_space(12.0);
-                ui.label(egui::RichText::new("CHECKS").size(10.0).color(self.muted()));
+                ui.label(
+                    egui::RichText::new(self.tr("CHECKS"))
+                        .size(10.0)
+                        .color(self.muted()),
+                );
                 let erc = self
                     .checks
                     .get("erc")
@@ -939,14 +1068,16 @@ impl App {
                     .and_then(Value::as_array)
                     .map(Vec::len)
                     .unwrap_or(0);
+                let erc_s = erc.to_string();
+                let drc_s = drc.to_string();
                 if ui
-                    .button(format!("{erc} electrical · {drc} board >"))
+                    .button(self.trf("{} electrical · {} board >", &[&erc_s, &drc_s]))
                     .clicked()
                 {
                     self.change_tab(Tab::Checks);
                 }
                 ui.label(
-                    egui::RichText::new("Initial checks; full ERC/DRC is in development.")
+                    egui::RichText::new(self.tr("Initial checks; full ERC/DRC is in development."))
                         .small()
                         .color(self.muted()),
                 );
@@ -961,14 +1092,17 @@ impl App {
                         .color(self.muted()),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let rev_s = self.revision.to_string();
                     ui.label(
-                        egui::RichText::new(format!("rev {}", self.revision))
+                        egui::RichText::new(self.trf("rev {}", &[&rev_s]))
                             .small()
                             .color(self.muted()),
                     );
                     if let Some(p) = self.cursor {
+                        let px = format!("{:.2}", p.x);
+                        let py = format!("{:.2}", p.y);
                         ui.label(
-                            egui::RichText::new(format!("{:.2}, {:.2} mm", p.x, p.y))
+                            egui::RichText::new(self.trf("{}, {} mm", &[&px, &py]))
                                 .small()
                                 .color(self.muted()),
                         );
@@ -978,26 +1112,26 @@ impl App {
         });
         egui::Panel::bottom("files").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Project file");
+                ui.label(self.tr("Project file"));
                 ui.add(egui::TextEdit::singleline(&mut self.path).desired_width(260.0));
-                if ui.button("Open").clicked() {
+                if ui.button(self.tr("Open")).clicked() {
                     self.tool_call("open", json!({"path":self.path}));
                 }
-                if ui.button("Save").clicked() {
+                if ui.button(self.tr("Save")).clicked() {
                     self.tool_call("save", json!({"path":self.path}));
                 }
-                if ui.button("Export KiCad board").clicked() {
+                if ui.button(self.tr("Export KiCad board")).clicked() {
                     let path = std::path::Path::new(&self.path)
                         .with_extension("kicad_pcb")
                         .to_string_lossy()
                         .into_owned();
                     self.tool_call("export", json!({"path":path,"format":"kicad_pcb"}));
                 }
-                if ui.button("LED example").clicked() {
+                if ui.button(self.tr("LED example")).clicked() {
                     self.tool_call("sample_design", json!({}));
                     self.fit();
                 }
-                if ui.button("New project").clicked() {
+                if ui.button(self.tr("New project")).clicked() {
                     self.tool_call("new_design", json!({}));
                     self.select(None);
                 }
@@ -1010,13 +1144,13 @@ impl App {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("ENGINE COMMAND")
+                            egui::RichText::new(self.tr("ENGINE COMMAND"))
                                 .small()
                                 .color(self.accent()),
                         );
                         ui.text_edit_singleline(&mut self.command);
                         ui.add(egui::TextEdit::singleline(&mut self.params).desired_width(500.0));
-                        if ui.button("Execute").clicked() {
+                        if ui.button(self.tr("Execute")).clicked() {
                             match serde_json::from_str(&self.params) {
                                 Ok(v) => self.run(&self.command.clone(), v),
                                 Err(e) => self.message = e.to_string(),
@@ -1044,20 +1178,20 @@ impl App {
     }
     fn library(&mut self, ui: &mut egui::Ui) {
         self.library_workspaces(ui);
-        ui.collapsing("Original starter symbols", |ui| {
+        ui.collapsing(self.tr("Original starter symbols"), |ui| {
             for t in TEMPLATES {
                 egui::Frame::group(ui.style())
                     .inner_margin(18.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(t.label).size(18.0).strong());
-                                ui.label(format!("{} · {} · 2 pins", t.prefix, t.value));
+                                ui.label(egui::RichText::new(self.tr(t.label)).size(18.0).strong());
+                                ui.label(self.trf("{} · {} · 2 pins", &[t.prefix, t.value]));
                             });
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button("Place in schematic >").clicked() {
+                                    if ui.button(self.tr("Place in schematic >")).clicked() {
                                         self.change_tab(Tab::Schematic);
                                         self.tool = Tool::Place(t.kind.into());
                                     }
@@ -1071,23 +1205,30 @@ impl App {
     }
     fn checks_view(&mut self, ui: &mut egui::Ui) {
         ui.add_space(24.0);
-        ui.heading("Design checks");
-        ui.label("Select a finding to inspect its affected object in the editor.");
+        ui.heading(self.tr("Design checks"));
+        i18n::wrapped_label(
+            ui,
+            self.preferences.language,
+            "Select a finding to inspect its affected object in the editor.",
+        );
         ui.add_space(16.0);
         let checks = self.checks.clone();
-        for (key, label) in [("erc", "Electrical"), ("drc", "Board")] {
-            ui.label(egui::RichText::new(label).size(18.0).strong());
+        for (key, label_key) in [("erc", "Electrical"), ("drc", "Board")] {
+            ui.label(egui::RichText::new(self.tr(label_key)).size(18.0).strong());
             if let Some(findings) = checks.get(key).and_then(Value::as_array) {
                 if findings.is_empty() {
                     ui.label(
-                        egui::RichText::new("No findings in the implemented checks")
+                        egui::RichText::new(self.tr("No findings in the implemented checks"))
                             .color(self.accent()),
                     );
                 }
+                let default_finding = self.tr("finding");
                 for f in findings {
                     let text = format!(
                         "{}   {}",
-                        f.get("code").and_then(Value::as_str).unwrap_or("finding"),
+                        f.get("code")
+                            .and_then(Value::as_str)
+                            .unwrap_or(&default_finding),
                         f.get("message").and_then(Value::as_str).unwrap_or("")
                     );
                     if ui.button(text).clicked()
@@ -1157,6 +1298,7 @@ impl App {
     fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.refresh();
+        self.ensure_fonts(&ctx);
         self.style(&ctx);
         self.shortcuts(&ctx);
         self.header(ui);
@@ -1193,6 +1335,15 @@ impl eframe::App for App {
             && text.len() <= pcbcraft_io_limit()
         {
             storage.set_string("recovery", text);
+        }
+    }
+}
+fn append_hebrew_fallback(fonts: &mut egui::FontDefinitions, name: &str) {
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        if let Some(list) = fonts.families.get_mut(&family)
+            && !list.iter().any(|existing| existing == name)
+        {
+            list.push(name.to_owned());
         }
     }
 }
@@ -1382,6 +1533,70 @@ mod tests {
         assert_eq!(
             app.project.component(2).map(|c| c.value.as_str()),
             Some("470 Ω")
+        );
+        Ok(())
+    }
+    #[test]
+    fn preferences_preserve_legacy_defaults_and_hebrew_round_trip() -> Result<(), String> {
+        let legacy: Preferences =
+            serde_json::from_str(r#"{"dark":false,"grid":true,"accent":[1,2,3]}"#)
+                .map_err(|e| e.to_string())?;
+        assert_eq!(legacy.language, i18n::Lang::English);
+        let iw: Preferences =
+            serde_json::from_str(r#"{"dark":true,"grid":true,"accent":[1,2,3],"language":"iw"}"#)
+                .map_err(|e| e.to_string())?;
+        assert_eq!(iw.language, i18n::Lang::Hebrew);
+        let priv_use: Preferences =
+            serde_json::from_str(r#"{"dark":true,"grid":true,"accent":[1,2,3],"language":"x-he"}"#)
+                .map_err(|e| e.to_string())?;
+        assert_eq!(priv_use.language, i18n::Lang::English);
+        let he = Preferences {
+            language: i18n::Lang::Hebrew,
+            ..Preferences::default()
+        };
+        let decoded: Preferences =
+            serde_json::from_str(&serde_json::to_string(&he).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        assert_eq!(decoded.language, i18n::Lang::Hebrew);
+        Ok(())
+    }
+    #[test]
+    fn hebrew_ui_renders_rtl_labels_across_tabs() -> Result<(), String> {
+        let shared =
+            pcbcraft_mcp::shared(pcbcraft_engine::Session::sample().map_err(|e| e.to_string())?);
+        let prefs = Preferences {
+            language: i18n::Lang::Hebrew,
+            ..Preferences::default()
+        };
+        let mut app = App::create(shared, prefs, None, None);
+        app.refresh();
+        app.appearance = true;
+        let ctx = egui::Context::default();
+        let output = frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        let painted: String = output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some(t.galley.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            painted.contains("סכמה"),
+            "missing Hebrew Schematic tab: {painted}"
+        );
+        assert!(
+            painted.contains("PCB פריסת"),
+            "missing visual RTL PCB Layout tab: {painted}"
+        );
+        assert!(
+            painted.contains("שפה"),
+            "missing Language label in Appearance panel: {painted}"
+        );
+        assert!(
+            painted.contains("עברית"),
+            "missing עברית button in Appearance panel: {painted}"
         );
         Ok(())
     }

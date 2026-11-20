@@ -73,17 +73,20 @@ impl App {
         if self.library.catalog.is_none() && self.library.pending.is_none() {
             self.library.request(ui.ctx(), "library.catalog", json!({}));
         }
-        ui.heading("KiCad libraries");
-        ui.label(
+        ui.heading(self.tr("KiCad libraries"));
+        i18n::wrapped_label(
+            ui,
+            self.preferences.language,
             "Browse installed libraries · definitions used by a project are embedded on placement.",
         );
         let busy = self.library.pending.is_some();
         let before = self.library.kind;
+        let lang = self.preferences.language;
         ui.add_enabled_ui(!busy, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.library.kind, false, "Symbols");
-                ui.selectable_value(&mut self.library.kind, true, "Footprints");
-                if ui.button("Refresh folders").clicked() {
+                ui.selectable_value(&mut self.library.kind, false, i18n::t(lang, "Symbols"));
+                ui.selectable_value(&mut self.library.kind, true, i18n::t(lang, "Footprints"));
+                if ui.button(i18n::t(lang, "Refresh folders")).clicked() {
                     self.library.catalog = None;
                     self.library.path.clear();
                     self.library.results = None;
@@ -128,10 +131,11 @@ impl App {
             }
         }
         ui.add_enabled_ui(!busy, |ui| {
+            let choose = self.tr("Choose library");
             let label = std::path::Path::new(&self.library.path)
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .unwrap_or("Choose library");
+                .unwrap_or(&choose);
             egui::ComboBox::from_id_salt("kicad-library")
                 .selected_text(label)
                 .width(300.0)
@@ -148,16 +152,16 @@ impl App {
                     }
                 });
             ui.horizontal(|ui| {
-                ui.label("Library path");
+                ui.label(self.tr("Library path"));
                 ui.add(egui::TextEdit::singleline(&mut self.library.path).desired_width(480.0));
             });
             ui.horizontal(|ui| {
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.library.query)
-                        .hint_text("Search names, descriptions, keywords")
+                        .hint_text(i18n::t(lang, "Search names, descriptions, keywords"))
                         .desired_width(360.0),
                 );
-                if ui.button("Search").clicked()
+                if ui.button(i18n::t(lang, "Search")).clicked()
                     || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                 {
                     changed = true;
@@ -170,11 +174,22 @@ impl App {
         if busy {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Reading library…");
+                ui.label(self.tr("Reading library…"));
             });
         }
         if !self.library.error.is_empty() {
-            ui.colored_label(Color32::from_rgb(237, 135, 113), &self.library.error);
+            let shown = self.tr(match self.library.error.as_str() {
+                "Installed library browsing is available in the desktop build." => {
+                    "Installed library browsing is available in the desktop build."
+                }
+                _ => "",
+            });
+            let err_text = if shown.is_empty() {
+                self.library.error.as_str()
+            } else {
+                shown.as_str()
+            };
+            ui.colored_label(Color32::from_rgb(237, 135, 113), err_text);
         }
         let results = self.library.results.clone().unwrap_or(json!({}));
         if self
@@ -185,62 +200,236 @@ impl App {
             .and_then(Value::as_bool)
             == Some(true)
         {
-            ui.label("Some library folders exceeded the scan limit; use a specific library path.");
+            i18n::wrapped_label(
+                ui,
+                self.preferences.language,
+                "Some library folders exceeded the scan limit; use a specific library path.",
+            );
         }
-        ui.columns(2,|cols| {
-            let left=&mut cols[0];
-            if let Some(total)=results.get("total").and_then(Value::as_u64) {left.label(format!("{total} matches in scanned entries · showing up to 100"));}
-            if results.get("scan_truncated").and_then(Value::as_bool)==Some(true) {left.label("Directory scan reached its limit; more entries may exist.");}
-            egui::ScrollArea::vertical().id_salt("library-results").max_height(360.0).show(left,|ui| {
-                for item in results.get("entries").and_then(Value::as_array).into_iter().flatten() {
-                    let name=item.get("name").and_then(Value::as_str).unwrap_or("");
-                    if ui.add_enabled(!busy,egui::Button::new(name).selected(self.library.preview.as_ref().and_then(|v|v.pointer("/definition/name")).and_then(Value::as_str)==Some(name))).clicked() {
-                        self.library.preview=None;
-                        let path=item.get("path").and_then(Value::as_str).unwrap_or(&self.library.path);
-                        let (tool,args)=if self.library.kind {("library.inspect_footprint",json!({"path":path,"include_source":true}))} else {("library.inspect_symbol",json!({"path":path,"name":name,"include_source":true}))};
-                        self.library.request(ui.ctx(),tool,args);
+        let lang = self.preferences.language;
+        ui.columns(2, |cols| {
+            let left = &mut cols[0];
+            if let Some(total) = results.get("total").and_then(Value::as_u64) {
+                let total_s = total.to_string();
+                left.label(i18n::tf(
+                    lang,
+                    "{} matches in scanned entries · showing up to 100",
+                    &[&total_s],
+                ));
+            }
+            if results.get("scan_truncated").and_then(Value::as_bool) == Some(true) {
+                left.label(i18n::t(
+                    lang,
+                    "Directory scan reached its limit; more entries may exist.",
+                ));
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("library-results")
+                .max_height(360.0)
+                .show(left, |ui| {
+                    for item in results
+                        .get("entries")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                        if ui
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new(name).selected(
+                                    self.library
+                                        .preview
+                                        .as_ref()
+                                        .and_then(|v| v.pointer("/definition/name"))
+                                        .and_then(Value::as_str)
+                                        == Some(name),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            self.library.preview = None;
+                            let path = item
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&self.library.path);
+                            let (tool, args) = if self.library.kind {
+                                (
+                                    "library.inspect_footprint",
+                                    json!({"path":path,"include_source":true}),
+                                )
+                            } else {
+                                (
+                                    "library.inspect_symbol",
+                                    json!({"path":path,"name":name,"include_source":true}),
+                                )
+                            };
+                            self.library.request(ui.ctx(), tool, args);
+                        }
                     }
+                });
+            let right = &mut cols[1];
+            if let Some(preview) = self.library.preview.clone() {
+                let path = preview
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                if preview.get("source_truncated").and_then(Value::as_bool) == Some(true) {
+                    i18n::wrapped_label(
+                        right,
+                        lang,
+                        "Original nodes exceed inline editing limits; the source file is preserved.",
+                    );
                 }
-            });
-            let right=&mut cols[1];
-            if let Some(preview)=self.library.preview.clone() {
-                let path=preview.get("path").and_then(Value::as_str).unwrap_or("").to_owned();
-                if preview.get("source_truncated").and_then(Value::as_bool)==Some(true) {right.label("Original nodes exceed inline editing limits; the source file is preserved.");}
                 if self.library.kind {
-                    if let Some(def)=preview.get("definition").and_then(|v|serde_json::from_value::<FootprintDefinition>(v.clone()).ok()) {
-                        right.heading(&def.name);right.label(&def.description);
-                        if right.add_enabled(preview.get("source_truncated").and_then(Value::as_bool)!=Some(true),egui::Button::new("Edit a copy →")).clicked() {let mut copy=def.clone();copy.name.push_str("_custom");self.library.editor.notice=Some(format!("Edited copy of {} from {}. KiCad-derived data credits the KiCad community contributors; custom sources retain their original license. Official collections: https://gitlab.com/kicad/libraries/kicad-symbols and https://gitlab.com/kicad/libraries/kicad-footprints.\n{}",def.name,path,include_str!("../../library/tests/fixtures/LICENSE-kicad-libraries.md")));self.library.editor.draft=Some(super::authoring::Draft::Footprint(copy));self.library.editor.mode=2;}
-                        self.library_preview(right,None,Some(&def));
-                        right.label(format!("{} pads · {} graphics",def.pads.len(),def.graphics.len()));
-                        let supported=pcbcraft_doc::validate_footprint_support(&def);
-                        if let Err(e)=&supported {right.label(e);}
-                        let component=self.selected.and_then(|id|self.project.component(id)).map(|c|(c.id,c.reference.clone()));
-                        if let Some((id,reference))=component {
-                            let matches=self.project.component(id).is_some_and(|c|c.pins.iter().map(|p|p.number.as_str()).collect::<std::collections::BTreeSet<_>>()==def.pads.iter().map(|p|p.number.as_str()).collect::<std::collections::BTreeSet<_>>());
-                            if !matches {right.label("Pad numbers must match every pin of the selected symbol.");}
-                            if right.add_enabled(supported.is_ok() && matches,egui::Button::new(format!("Assign to {reference}"))).clicked() {self.run("footprint.assign",json!({"id":id,"path":path}));}
-                        } else {right.label("Select a schematic component before assigning its footprint.");}
+                    if let Some(def) = preview
+                        .get("definition")
+                        .and_then(|v| serde_json::from_value::<FootprintDefinition>(v.clone()).ok())
+                    {
+                        right.heading(&def.name);
+                        right.label(&def.description);
+                        if right
+                            .add_enabled(
+                                preview.get("source_truncated").and_then(Value::as_bool)
+                                    != Some(true),
+                                egui::Button::new(i18n::t(lang, "Edit a copy →")),
+                            )
+                            .clicked()
+                        {
+                            let mut copy = def.clone();
+                            copy.name.push_str("_custom");
+                            self.library.editor.notice = Some(format!(
+                                "Edited copy of {} from {}. KiCad-derived data credits the KiCad community contributors; custom sources retain their original license. Official collections: https://gitlab.com/kicad/libraries/kicad-symbols and https://gitlab.com/kicad/libraries/kicad-footprints.\n{}",
+                                def.name,
+                                path,
+                                include_str!("../../library/tests/fixtures/LICENSE-kicad-libraries.md")
+                            ));
+                            self.library.editor.draft = Some(super::authoring::Draft::Footprint(copy));
+                            self.library.editor.mode = 2;
+                        }
+                        self.library_preview(right, None, Some(&def));
+                        let pads_s = def.pads.len().to_string();
+                        let gfx_s = def.graphics.len().to_string();
+                        right.label(i18n::tf(lang, "{} pads · {} graphics", &[&pads_s, &gfx_s]));
+                        let supported = pcbcraft_doc::validate_footprint_support(&def);
+                        if let Err(e) = &supported {
+                            right.label(e);
+                        }
+                        let component = self
+                            .selected
+                            .and_then(|id| self.project.component(id))
+                            .map(|c| (c.id, c.reference.clone()));
+                        if let Some((id, reference)) = component {
+                            let matches = self.project.component(id).is_some_and(|c| {
+                                c.pins
+                                    .iter()
+                                    .map(|p| p.number.as_str())
+                                    .collect::<std::collections::BTreeSet<_>>()
+                                    == def
+                                        .pads
+                                        .iter()
+                                        .map(|p| p.number.as_str())
+                                        .collect::<std::collections::BTreeSet<_>>()
+                            });
+                            if !matches {
+                                i18n::wrapped_label(
+                                    right,
+                                    lang,
+                                    "Pad numbers must match every pin of the selected symbol.",
+                                );
+                            }
+                            if right
+                                .add_enabled(
+                                    supported.is_ok() && matches,
+                                    egui::Button::new(i18n::tf(lang, "Assign to {}", &[&reference])),
+                                )
+                                .clicked()
+                            {
+                                self.run("footprint.assign", json!({"id":id,"path":path}));
+                            }
+                        } else {
+                            i18n::wrapped_label(
+                                right,
+                                lang,
+                                "Select a schematic component before assigning its footprint.",
+                            );
+                        }
                     }
-                } else if let Some(def)=preview.get("definition").and_then(|v|serde_json::from_value::<SymbolDefinition>(v.clone()).ok()) {
-                    right.heading(&def.name);right.label(&def.description);
-                    if right.add_enabled(preview.get("source_truncated").and_then(Value::as_bool)!=Some(true),egui::Button::new("Edit a copy →")).clicked() {let mut copy=def.clone();copy.name.push_str("_custom");self.library.editor.notice=Some(format!("Edited copy of {} from {}. KiCad-derived data credits the KiCad community contributors; custom sources retain their original license. Official collections: https://gitlab.com/kicad/libraries/kicad-symbols and https://gitlab.com/kicad/libraries/kicad-footprints.\n{}",def.name,path,include_str!("../../library/tests/fixtures/LICENSE-kicad-libraries.md")));self.library.editor.draft=Some(super::authoring::Draft::Symbol(copy));self.library.editor.mode=2;}
-                    self.library_preview(right,Some(&def),None);
-                    let supported=pcbcraft_doc::library_component(def.clone(),"preview".into(),0,"preview".into(),Point::default(),None).is_ok();
-                    right.label(format!("{} pins · {} units",def.pins.len(),def.pins.iter().map(|p|p.unit).max().unwrap_or(1)));
-                    right.label(format!("Suggested footprint: {}",def.footprint));
-                    if right.add_enabled(supported,egui::Button::new("Place in schematic →")).clicked() {
-                        self.change_tab(Tab::Schematic);self.tool=Tool::LibraryPlace(path,def.name.clone(),Box::new(def));
+                } else if let Some(def) = preview
+                    .get("definition")
+                    .and_then(|v| serde_json::from_value::<SymbolDefinition>(v.clone()).ok())
+                {
+                    right.heading(&def.name);
+                    right.label(&def.description);
+                    if right
+                        .add_enabled(
+                            preview.get("source_truncated").and_then(Value::as_bool) != Some(true),
+                            egui::Button::new(i18n::t(lang, "Edit a copy →")),
+                        )
+                        .clicked()
+                    {
+                        let mut copy = def.clone();
+                        copy.name.push_str("_custom");
+                        self.library.editor.notice = Some(format!(
+                            "Edited copy of {} from {}. KiCad-derived data credits the KiCad community contributors; custom sources retain their original license. Official collections: https://gitlab.com/kicad/libraries/kicad-symbols and https://gitlab.com/kicad/libraries/kicad-footprints.\n{}",
+                            def.name,
+                            path,
+                            include_str!("../../library/tests/fixtures/LICENSE-kicad-libraries.md")
+                        ));
+                        self.library.editor.draft = Some(super::authoring::Draft::Symbol(copy));
+                        self.library.editor.mode = 2;
                     }
-                    if !supported {right.label("Inspection available; unsupported pin/graphic styles or repeated common pin numbers cannot be placed yet.");}
+                    self.library_preview(right, Some(&def), None);
+                    let supported = pcbcraft_doc::library_component(
+                        def.clone(),
+                        "preview".into(),
+                        0,
+                        "preview".into(),
+                        Point::default(),
+                        None,
+                    )
+                    .is_ok();
+                    let pins_s = def.pins.len().to_string();
+                    let units_s = def.pins.iter().map(|p| p.unit).max().unwrap_or(1).to_string();
+                    right.label(i18n::tf(lang, "{} pins · {} units", &[&pins_s, &units_s]));
+                    right.label(i18n::tf(lang, "Suggested footprint: {}", &[&def.footprint]));
+                    if right
+                        .add_enabled(
+                            supported,
+                            egui::Button::new(i18n::t(lang, "Place in schematic →")),
+                        )
+                        .clicked()
+                    {
+                        self.change_tab(Tab::Schematic);
+                        self.tool = Tool::LibraryPlace(path, def.name.clone(), Box::new(def));
+                    }
+                    if !supported {
+                        i18n::wrapped_label(
+                            right,
+                            lang,
+                            "Inspection available; unsupported pin/graphic styles or repeated common pin numbers cannot be placed yet.",
+                        );
+                    }
                 }
-            } else {right.label("Choose an entry to preview its real geometry.");}
+            } else {
+                i18n::wrapped_label(
+                    right,
+                    lang,
+                    "Choose an entry to preview its real geometry.",
+                );
+            }
         });
         ui.separator();
         ui.hyperlink_to(
-            "KiCad libraries: CC-BY-SA 4.0 + design exception",
+            self.tr("KiCad libraries: CC-BY-SA 4.0 + design exception"),
             "https://www.kicad.org/libraries/license/",
         );
-        ui.label("Placement: single/multi-unit symbols, matching front SMD or plated through-hole packages. Use Edit a copy to customize a definition.");
+        i18n::wrapped_label(
+            ui,
+            self.preferences.language,
+            "Placement: single/multi-unit symbols, matching front SMD or plated through-hole packages. Use Edit a copy to customize a definition.",
+        );
     }
     pub(super) fn library_preview(
         &mut self,
@@ -259,7 +448,7 @@ impl App {
             }
             if units.len() > 1 {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Preview unit");
+                    ui.label(self.tr("Preview unit"));
                     for unit in units {
                         ui.selectable_value(&mut self.library.preview_unit, unit, unit.to_string());
                     }

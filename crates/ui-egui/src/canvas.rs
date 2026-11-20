@@ -265,7 +265,7 @@ impl App {
         } else {
             self.paint_board(&painter, rect, camera, &visible);
         }
-        let text = match &self.tool {
+        let text = self.tr(match &self.tool {
             Tool::Select => "SELECT",
             Tool::Place(_) => "PLACE SYMBOL · CLICK TO COMMIT",
             Tool::LibraryPlace(..) | Tool::CustomPlace(..) => {
@@ -277,7 +277,7 @@ impl App {
             Tool::Route(Some(_)) => "ROUTE · PICK SECOND PAD",
             Tool::Move => "MOVE · CLICK TO PLACE SELECTION",
             Tool::Cutout => "CUTOUT · CLICK TO PLACE",
-        };
+        });
         painter.text(
             rect.left_top() + Vec2::new(20.0, 20.0),
             Align2::LEFT_TOP,
@@ -983,9 +983,13 @@ impl App {
         painter.text(
             board.left_bottom() + Vec2::new(0.0, 18.0),
             Align2::LEFT_TOP,
-            format!(
+            self.trf(
                 "{} × {} mm    F.Cu / B.Cu    clearance {} mm",
-                p.board.width, p.board.height, p.board.clearance
+                &[
+                    &p.board.width.to_string(),
+                    &p.board.height.to_string(),
+                    &p.board.clearance.to_string(),
+                ],
             ),
             FontId::monospace(11.0),
             self.muted(),
